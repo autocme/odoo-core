@@ -19,3 +19,5 @@ Removed unnecessary directories
 
 Lightweight and optimized
 Perfect base for Odoo SaaS, multi-tenant platforms, and custom builds
+It does not work without the addons folder located here:
+https://github.com/autocme/odoo-core-addons
