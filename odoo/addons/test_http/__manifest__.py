@@ -6,6 +6,10 @@
     'description': """A module to test HTTP""",
     'depends': ['base', 'web', 'web_tour'],
     'installable': True,
-    'data': [],
+    'data': [
+        'data.xml',
+        'ir.model.access.csv',
+        'views.xml'
+    ],
     'license': 'LGPL-3',
 }

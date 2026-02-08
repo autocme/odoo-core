@@ -1,8 +1,6 @@
-# -*- coding: utf-8 -*-
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 
 from . import assetsbundle
-from . import qweb
 
 from . import ir_model
 from . import ir_sequence
@@ -12,10 +10,10 @@ from . import ir_asset
 from . import ir_actions
 from . import ir_actions_report
 from . import ir_attachment
+from . import ir_binary
 from . import ir_cron
 from . import ir_filters
 from . import ir_default
-from . import ir_translation
 from . import ir_exports
 from . import ir_rule
 from . import ir_config_parameter
@@ -45,5 +43,7 @@ from . import res_config
 from . import res_currency
 from . import res_company
 from . import res_users
+from . import res_users_settings
+from . import res_users_deletion
 
 from . import decimal_precision

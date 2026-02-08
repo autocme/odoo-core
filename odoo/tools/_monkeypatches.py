@@ -1,12 +1,22 @@
 import ast
 import os
 import logging
+from email._policybase import _PolicyBase
+from odoo import MIN_PY_VERSION
 from shutil import copyfileobj
 from types import CodeType
 
 _logger = logging.getLogger(__name__)
 
-from werkzeug.datastructures import FileStorage
+try:
+    import num2words
+    from .num2words_patch import Num2Word_AR_Fixed
+except ImportError:
+    _logger.warning("num2words is not available, Arabic number to words conversion will not work")
+    num2words = None
+
+from urllib3 import PoolManager
+from werkzeug.datastructures import FileStorage, MultiDict
 from werkzeug.routing import Rule
 from werkzeug.wrappers import Request, Response
 
@@ -37,6 +47,14 @@ else:
     xlsx.Element_has_iter = True
 
 FileStorage.save = lambda self, dst, buffer_size=1<<20: copyfileobj(self.stream, dst, buffer_size)
+
+
+def _multidict_deepcopy(self, memo=None):
+    return orig_deepcopy(self)
+
+
+orig_deepcopy = MultiDict.deepcopy
+MultiDict.deepcopy = _multidict_deepcopy
 
 Request.json_module = Response.json_module = scriptsafe
 
@@ -70,6 +88,12 @@ def literal_eval(expr):
     return orig_literal_eval(expr)
 
 ast.literal_eval = literal_eval
+
+if MIN_PY_VERSION >= (3, 12):
+    raise RuntimeError("The num2words monkey patch is obsolete. Bump the version of the library to the latest available in the official package repository, if it hasn't already been done, and remove the patch.")
+
+if num2words:
+    num2words.CONVERTER_CLASSES["ar"] = Num2Word_AR_Fixed()
 
 _soap_clients = {}
 
@@ -121,3 +145,28 @@ def new_get_soap_client(wsdlurl, timeout=30):
 
 if util:
     util.get_soap_client = new_get_soap_client
+
+
+def pool_init(self, *args, **kwargs):
+    orig_pool_init(self, *args, **kwargs)
+    self.pool_classes_by_scheme = {**self.pool_classes_by_scheme}
+
+
+orig_pool_init = PoolManager.__init__
+PoolManager.__init__ = pool_init
+
+
+def policy_clone(self, **kwargs):
+    for arg in kwargs:
+        if arg.startswith("_") or "__" in arg or arg == "clone":
+            raise AttributeError(f"{self.__class__.__name__!r} object has no attribute {arg!r}")
+    return orig_policy_clone(self, **kwargs)
+
+
+def policy_add(self, other):
+    return policy_clone(self, **other.__dict__)
+
+
+orig_policy_clone = _PolicyBase.clone
+_PolicyBase.clone = policy_clone
+_PolicyBase.__add__ = policy_add

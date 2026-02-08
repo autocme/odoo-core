@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
+import sys
 import time
+
+from unittest.mock import patch
 
 from odoo.exceptions import AccessError
 from odoo.tests.common import BaseCase, TransactionCase, tagged, new_test_user
@@ -415,74 +418,33 @@ class TestProfiling(TransactionCase):
         self.assertEqual(entries.pop(0)['exec_context'], ((stack_level, {'letter': 'a'}), (stack_level, {'letter': 'c'})))
         self.assertEqual(entries.pop(0)['exec_context'], ((stack_level, {'letter': 'a'}),))
 
-    def test_sync_recorder(self):
-        def a():
-            b()
-            c()
-
-        def b():
-            pass
-
-        def c():
-            d()
-            d()
-
-        def d():
-            pass
-
-        with Profiler(description='test', collectors=['traces_sync'], db=None) as p:
-            a()
-
-        stacks = [r['stack'] for r in p.collectors[0].entries]
-
-        # map stack frames to their function name, and check
-        stacks_methods = [[frame[2] for frame in stack] for stack in stacks]
-        self.assertEqual(stacks_methods, [
-            ['a'],
-            ['a', 'b'],
-            ['a'],
-            ['a', 'c'],
-            ['a', 'c', 'd'],
-            ['a', 'c'],
-            ['a', 'c', 'd'],
-            ['a', 'c'],
-            ['a'],
-            [],
-            ['__exit__'],
-            ['__exit__', 'stop']  # could be removed by cleaning two last frames, or removing last frames only contained in profiler.py
-        ])
-
-        # map stack frames to their line number, and check
-        stacks_lines = [[frame[1] for frame in stack] for stack in stacks]
-        self.assertEqual(stacks_lines[1][0] + 1, stacks_lines[3][0],
-                         "Call of b() in a() should be one line before call of c()")
-
     def test_qweb_recorder(self):
         template = self.env['ir.ui.view'].create({
             'name': 'test',
             'type': 'qweb',
+            'key': 'root',
             'arch_db': '''<t t-name="root">
                 <t t-foreach="{'a': 3, 'b': 2, 'c': 1}" t-as="item">
-                    [<t t-esc="item_index"/>: <t t-call="base.dummy"/> <t t-esc="item_value"/>]
-                    <b t-esc="add_one_query()"/>
-                </t>
+                    [<t t-out="item_index"/>: <t t-set="record" t-value="item"/><t t-call="base.dummy"/> <t t-out="item_value"/>]
+                    <b t-out="add_one_query()"/></t>
             </t>'''
         })
         child_template = self.env['ir.ui.view'].create({
             'name': 'test',
             'type': 'qweb',
-            'arch_db': '<t t-name="dummy"><span><t t-esc="item"/> <t t-esc="add_one_query()"/></span></t>'
+            'key': 'dummy',
+            'arch_db': '<t t-name="dummy"><span t-attf-class="myclass"><t t-out="record"/> <t t-out="add_one_query()"/></span></t>'
         })
         self.env.cr.execute("INSERT INTO ir_model_data(name, model, res_id, module)"
                             "VALUES ('dummy', 'ir.ui.view', %s, 'base')", [child_template.id])
 
         values = {'add_one_query': lambda: self.env.cr.execute('SELECT id FROM ir_ui_view LIMIT 1') or 'query'}
         result = u"""
-                    [0: <span>a query</span> 3]
+                    [0: <span class="myclass">a query</span> 3]
                     <b>query</b>
-                    [1: <span>b query</span> 2]
+                    [1: <span class="myclass">b query</span> 2]
                     <b>query</b>
-                    [2: <span>c query</span> 1]
+                    [2: <span class="myclass">c query</span> 1]
                     <b>query</b>
         """
 
@@ -511,41 +473,48 @@ class TestProfiling(TransactionCase):
         for data in p.collectors[0].entries[0]['results']['data']:
             data.pop('delay')
 
+        data = p.collectors[0].entries[0]['results']['data']
         expected = [
             # pylint: disable=bad-whitespace
             # first template and first directive
             {'view_id': template.id,       'xpath': '/t/t',         'directive': """t-foreach="{'a': 3, 'b': 2, 'c': 1}" t-as='item'""", 'query': 0},
             # first pass in the loop
-            {'view_id': template.id,       'xpath': '/t/t/t[1]',    'directive': "t-esc='item_index'", 'query': 0},
-            {'view_id': template.id,       'xpath': '/t/t/t[2]',    'directive': "t-call='base.dummy'", 'query': 0}, # the compiled template method is in cache
+            {'view_id': template.id,       'xpath': '/t/t/t[1]',    'directive': "t-out='item_index'", 'query': 0},
+            {'view_id': template.id,       'xpath': '/t/t/t[2]',    'directive': "t-set='record' t-value='item'", 'query': 0},
+            {'view_id': template.id,       'xpath': '/t/t/t[3]',    'directive': "t-call='base.dummy'", 'query': 0}, # 0 because the template is in ir.ui.view cache
             # first pass in the loop: content of the child template
-            {'view_id': child_template.id, 'xpath': '/t/span/t[1]', 'directive': "t-esc='item'", 'query': 0},
-            {'view_id': child_template.id, 'xpath': '/t/span/t[2]', 'directive': "t-esc='add_one_query()'", 'query': 1},
-            {'view_id': template.id,       'xpath': '/t/t/t[3]',    'directive': "t-esc='item_value'", 'query': 0},
-            {'view_id': template.id,       'xpath': '/t/t/b',       'directive': "t-esc='add_one_query()'", 'query':1},
+            {'view_id': child_template.id, 'xpath': '/t/span',      'directive': "t-attf-class='myclass'", 'query': 0},
+            {'view_id': child_template.id, 'xpath': '/t/span/t[1]', 'directive': "t-out='record'", 'query': 0},
+            {'view_id': child_template.id, 'xpath': '/t/span/t[2]', 'directive': "t-out='add_one_query()'", 'query': 1},
+            {'view_id': template.id,       'xpath': '/t/t/t[4]',    'directive': "t-out='item_value'", 'query': 0},
+            {'view_id': template.id,       'xpath': '/t/t/b',       'directive': "t-out='add_one_query()'", 'query':1},
             # second pass in the loop
-            {'view_id': template.id,       'xpath': '/t/t/t[1]',    'directive': "t-esc='item_index'", 'query': 0},
-            {'view_id': template.id,       'xpath': '/t/t/t[2]',    'directive': "t-call='base.dummy'", 'query': 0}, # 0 because the template is in cache
-            {'view_id': child_template.id, 'xpath': '/t/span/t[1]', 'directive': "t-esc='item'", 'query': 0},
-            {'view_id': child_template.id, 'xpath': '/t/span/t[2]', 'directive': "t-esc='add_one_query()'", 'query': 1},
-            {'view_id': template.id,       'xpath': '/t/t/t[3]',    'directive': "t-esc='item_value'", 'query': 0},
-            {'view_id': template.id,       'xpath': '/t/t/b',       'directive': "t-esc='add_one_query()'", 'query':1},
+            {'view_id': template.id,       'xpath': '/t/t/t[1]',    'directive': "t-out='item_index'", 'query': 0},
+            {'view_id': template.id,       'xpath': '/t/t/t[2]',    'directive': "t-set='record' t-value='item'", 'query': 0},
+            {'view_id': template.id,       'xpath': '/t/t/t[3]',    'directive': "t-call='base.dummy'", 'query': 0},
+            {'view_id': child_template.id, 'xpath': '/t/span',      'directive': "t-attf-class='myclass'", 'query': 0},
+            {'view_id': child_template.id, 'xpath': '/t/span/t[1]', 'directive': "t-out='record'", 'query': 0},
+            {'view_id': child_template.id, 'xpath': '/t/span/t[2]', 'directive': "t-out='add_one_query()'", 'query': 1},
+            {'view_id': template.id,       'xpath': '/t/t/t[4]',    'directive': "t-out='item_value'", 'query': 0},
+            {'view_id': template.id,       'xpath': '/t/t/b',       'directive': "t-out='add_one_query()'", 'query':1},
             # third pass in the loop
-            {'view_id': template.id,       'xpath': '/t/t/t[1]',    'directive': "t-esc='item_index'", 'query': 0},
-            {'view_id': template.id,       'xpath': '/t/t/t[2]',    'directive': "t-call='base.dummy'", 'query': 0},
-            {'view_id': child_template.id, 'xpath': '/t/span/t[1]', 'directive': "t-esc='item'", 'query': 0},
-            {'view_id': child_template.id, 'xpath': '/t/span/t[2]', 'directive': "t-esc='add_one_query()'", 'query': 1},
-            {'view_id': template.id,       'xpath': '/t/t/t[3]',    'directive': "t-esc='item_value'", 'query': 0},
-            {'view_id': template.id,       'xpath': '/t/t/b',       'directive': "t-esc='add_one_query()'", 'query':1},
+            {'view_id': template.id,       'xpath': '/t/t/t[1]',    'directive': "t-out='item_index'", 'query': 0},
+            {'view_id': template.id,       'xpath': '/t/t/t[2]',    'directive': "t-set='record' t-value='item'", 'query': 0},
+            {'view_id': template.id,       'xpath': '/t/t/t[3]',    'directive': "t-call='base.dummy'", 'query': 0},
+            {'view_id': child_template.id, 'xpath': '/t/span',      'directive': "t-attf-class='myclass'", 'query': 0},
+            {'view_id': child_template.id, 'xpath': '/t/span/t[1]', 'directive': "t-out='record'", 'query': 0},
+            {'view_id': child_template.id, 'xpath': '/t/span/t[2]', 'directive': "t-out='add_one_query()'", 'query': 1},
+            {'view_id': template.id,       'xpath': '/t/t/t[4]',    'directive': "t-out='item_value'", 'query': 0},
+            {'view_id': template.id,       'xpath': '/t/t/b',       'directive': "t-out='add_one_query()'", 'query':1},
         ]
-        self.assertEqual(p.collectors[0].entries[0]['results']['data'], expected)
+        self.assertEqual(data, expected)
 
     def test_default_recorders(self):
         with Profiler(db=None) as p:
             queries_start = self.env.cr.sql_log_count
             for i in range(10):
                 self.env['res.partner'].create({'name': 'snail%s' % i})
-            self.env['res.partner'].flush()
+            self.env.flush_all()
             total_queries = self.env.cr.sql_log_count - queries_start
 
         rq = next(r for r in p.collectors if r.name == "sql").entries
@@ -560,6 +529,18 @@ class TestProfiling(TransactionCase):
         self.assertGreater(first_query['time'], 0)
         self.assertEqual(first_query['stack'][-1][2], 'execute')
         self.assertEqual(first_query['stack'][-1][0].split('/')[-1], 'sql_db.py')
+
+    def test_profiler_return(self):
+        # Enter test mode to avoid the profiler to commit the result
+        self.registry.enter_test_mode(self.cr)
+        self.addCleanup(self.registry.leave_test_mode)
+        # Trick: patch db_connect() to make it return the registry with the current test cursor
+        # See `ProfilingHttpCase`
+        self.startClassPatcher(patch('odoo.sql_db.db_connect', return_value=self.registry))
+        with self.profile(collectors=["sql"]) as p:
+            self.env.cr.execute("SELECT 1")
+        p.json()  # check we can call it
+        self.assertEqual(p.collectors[0].entries[0]['query'], 'SELECT 1')
 
 
 def deep_call(func, depth):
@@ -635,3 +616,50 @@ class TestPerformance(BaseCase):
             time.sleep(1)
         entry_count = len(res.collectors[0].entries)
         self.assertLess(entry_count, 5)  # ~3
+
+
+@tagged('-standard', 'profiling')
+class TestSyncRecorder(BaseCase):
+    # this test was made non standard because it can break for strange reason because of additionnal _remove or signal_handler frame
+    def test_sync_recorder(self):
+        if sys.gettrace() is not None:
+            self.skipTest(f'Cannot start SyncCollector, settrace already set: {sys.gettrace()}')
+
+        def a():
+            b()
+            c()
+
+        def b():
+            pass
+
+        def c():
+            d()
+            d()
+
+        def d():
+            pass
+
+        with Profiler(description='test', collectors=['traces_sync'], db=None) as p:
+            a()
+
+        stacks = [r['stack'] for r in p.collectors[0].entries]
+
+        # map stack frames to their function name, and check
+        stacks_methods = [[frame[2] for frame in stack] for stack in stacks]
+        self.assertEqual(stacks_methods[:-2], [
+            ['a'],
+            ['a', 'b'],
+            ['a'],
+            ['a', 'c'],
+            ['a', 'c', 'd'],
+            ['a', 'c'],
+            ['a', 'c', 'd'],
+            ['a', 'c'],
+            ['a'],
+            [],
+        ])
+
+        # map stack frames to their line number, and check
+        stacks_lines = [[frame[1] for frame in stack] for stack in stacks]
+        self.assertEqual(stacks_lines[1][0] + 1, stacks_lines[3][0],
+                         "Call of b() in a() should be one line before call of c()")

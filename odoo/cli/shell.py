@@ -1,12 +1,11 @@
-# -*- coding: utf-8 -*-
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
-
-from __future__ import print_function
 import code
 import logging
 import os
 import signal
 import sys
+import threading
+from pathlib import Path
 
 import odoo
 from odoo.tools import config
@@ -56,6 +55,7 @@ class Shell(Command):
     supported_shells = ['ipython', 'ptpython', 'bpython', 'python']
 
     def init(self, args):
+        config.parser.prog = f'{Path(sys.argv[0]).name} {self.name}'
         config.parse_config(args)
         odoo.cli.server.report_configuration()
         odoo.service.server.start(preload=[], stop=True)
@@ -107,6 +107,7 @@ class Shell(Command):
             'odoo': odoo,
         }
         if dbname:
+            threading.current_thread().dbname = dbname
             registry = odoo.registry(dbname)
             with registry.cursor() as cr:
                 uid = odoo.SUPERUSER_ID
@@ -114,6 +115,10 @@ class Shell(Command):
                 env = odoo.api.Environment(cr, uid, ctx)
                 local_vars['env'] = env
                 local_vars['self'] = env.user
+                # context_get() has started the transaction already. Rollback to
+                # avoid logging warning "rolling back the transaction before testing"
+                # from odoo.tests.shell.run_tests if the user hasn't done anything.
+                cr.rollback()
                 self.console(local_vars)
                 cr.rollback()
         else:

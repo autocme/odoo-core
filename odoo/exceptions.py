@@ -12,10 +12,7 @@ treated as a 'Server error'.
     check out the :mod:`odoo.addons.test_exceptions` module.
 """
 
-import logging
 import warnings
-
-_logger = logging.getLogger(__name__)
 
 
 class UserError(Exception):
@@ -30,13 +27,6 @@ class UserError(Exception):
         :param message: exception message and frontend modal content
         """
         super().__init__(message)
-
-    @property
-    def name(self):
-        warnings.warn(
-            "UserError attribute 'name' is a deprecated alias to args[0]",
-            DeprecationWarning)
-        return self.args[0]
 
 
 class RedirectWarning(Exception):
@@ -118,23 +108,3 @@ class ValidationError(UserError):
 
         When you try to create a new user with a login which already exist in the db.
     """
-
-
-# Deprecated exceptions, only kept for backward compatibility, may be
-# removed in the future *without* any further notice than the Deprecation
-# Warning.
-
-class except_orm(UserError):
-    def __init__(self, name, value=None):
-        warnings.warn("except_orm is a deprecated alias to UserError.", DeprecationWarning)
-        super().__init__(f"{name}: {value}")
-
-class Warning(UserError):
-    def __init__(self, *args, **kwargs):
-        warnings.warn("Warning is a deprecated alias to UserError.", DeprecationWarning)
-        super().__init__(*args, **kwargs)
-
-class QWebException(Exception):
-    def __init__(self, *args, **kwargs):
-        warnings.warn("qweb.QWebException is the exception you are looking for.", DeprecationWarning)
-        super().__init__(*args, **kwargs)

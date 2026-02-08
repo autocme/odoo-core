@@ -23,29 +23,35 @@ class IrDefault(models.Model):
     condition = fields.Char('Condition', help="If set, applies the default upon condition.")
     json_value = fields.Char('Default Value (JSON format)', required=True)
 
-    @api.constrains('json_value')
+    @api.constrains('json_value', 'field_id')
     def _check_json_format(self):
         for record in self:
+            model_name = record.sudo().field_id.model_id.model
+            model = self.env[model_name]
+            field = model._fields[record.field_id.name]
             try:
-                json.loads(record.json_value)
+                value = json.loads(record.json_value)
+                field.convert_to_cache(value, model)
             except json.JSONDecodeError:
                 raise ValidationError(_('Invalid JSON format in Default Value field.'))
+            except Exception:  # noqa: BLE001
+                raise ValidationError(_("Invalid value in Default Value field. Expected type '%s' for '%s.%s'.", record.field_id.ttype, model_name, record.field_id.name))
 
     @api.model_create_multi
     def create(self, vals_list):
-        self.clear_caches()
+        self.env.registry.clear_cache()
         return super(IrDefault, self).create(vals_list)
 
     def write(self, vals):
         if self:
-            self.clear_caches()
+            self.env.registry.clear_cache()
         new_default = super().write(vals)
         self.check_access_rule('write')
         return new_default
 
     def unlink(self):
         if self:
-            self.clear_caches()
+            self.env.registry.clear_cache()
         return super(IrDefault, self).unlink()
 
     @api.model
@@ -54,6 +60,9 @@ class IrDefault(models.Model):
             scope (field, user, company) will be replaced. The value is encoded
             in JSON to be stored to the database.
 
+            :param model_name:
+            :param field_name:
+            :param value:
             :param user_id: may be ``False`` for all users, ``True`` for the
                             current user, or any user id
             :param company_id: may be ``False`` for all companies, ``True`` for
@@ -72,12 +81,14 @@ class IrDefault(models.Model):
         try:
             model = self.env[model_name]
             field = model._fields[field_name]
-            field.convert_to_cache(value, model)
+            parsed = field.convert_to_cache(value, model)
             json_value = json.dumps(value, ensure_ascii=False)
         except KeyError:
-            raise ValidationError(_("Invalid field %s.%s") % (model_name, field_name))
+            raise ValidationError(_("Invalid field %s.%s", model_name, field_name))
         except Exception:
-            raise ValidationError(_("Invalid value for %s.%s: %s") % (model_name, field_name, value))
+            raise ValidationError(_("Invalid value for %s.%s: %s", model_name, field_name, value))
+        if field.type == 'integer' and not (-2**31 < parsed < 2**31-1):
+            raise ValidationError(_("Invalid value for %s.%s: %s is out of bounds (integers should be between -2,147,483,648 and 2,147,483,647)", model_name, field_name, value))
 
         # update existing default for the same scope, or create one
         field = self.env['ir.model.fields']._get(model_name, field_name)
@@ -86,9 +97,11 @@ class IrDefault(models.Model):
             ('user_id', '=', user_id),
             ('company_id', '=', company_id),
             ('condition', '=', condition),
-        ])
+        ], limit=1)
         if default:
-            default.write({'json_value': json_value})
+            # Avoid clearing the cache if nothing changes
+            if default.json_value != json_value:
+                default.write({'json_value': json_value})
         else:
             self.create({
                 'field_id': field.id,
@@ -100,10 +113,12 @@ class IrDefault(models.Model):
         return True
 
     @api.model
-    def get(self, model_name, field_name, user_id=False, company_id=False, condition=False):
+    def _get(self, model_name, field_name, user_id=False, company_id=False, condition=False):
         """ Return the default value for the given field, user and company, or
             ``None`` if no default is available.
 
+            :param model_name:
+            :param field_name:
             :param user_id: may be ``False`` for all users, ``True`` for the
                             current user, or any user id
             :param company_id: may be ``False`` for all companies, ``True`` for
@@ -132,7 +147,7 @@ class IrDefault(models.Model):
     # Note about ormcache invalidation: it is not needed when deleting a field,
     # a user, or a company, as the corresponding defaults will no longer be
     # requested. It must only be done when a user's company is modified.
-    def get_model_defaults(self, model_name, condition=False):
+    def _get_model_defaults(self, model_name, condition=False):
         """ Return the available default values for the given model (for the
             current user), as a dict mapping field names to values.
         """

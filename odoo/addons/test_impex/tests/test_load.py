@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
-
+import contextlib
 import json
 import pkgutil
 import re
@@ -9,6 +9,7 @@ from odoo import fields
 from odoo.addons.base.tests.common import SavepointCaseWithUserDemo
 from odoo.tests import common
 from odoo.tools.misc import mute_logger
+from odoo.tools.translate import code_translations
 
 def message(msg, type='error', from_=0, to_=0, record=0, field='value', **kwargs):
     return dict(kwargs,
@@ -39,7 +40,7 @@ class ImporterCase(common.TransactionCase):
     def setUp(self):
         super(ImporterCase, self).setUp()
         self.model = self.env[self.model_name]
-        self.env['ir.model.data'].clear_caches()
+        self.env.registry.clear_cache()
         self.cr.cache.clear()
 
     def import_(self, fields, rows, context=None):
@@ -67,7 +68,7 @@ class ImporterCase(common.TransactionCase):
             return d['name']
 
         name = record.display_name
-        # fix dotted name_get results, otherwise xid lookups blow up
+        # fix dotted display_name results, otherwise xid lookups blow up
         name = name.replace('.', '-')
         ModelData.create({
             'name': name,
@@ -76,19 +77,6 @@ class ImporterCase(common.TransactionCase):
             'module': '__test__'
         })
         return '__test__.' + name
-
-    def add_translations(self, name, type, code, *tnx):
-        self.env['res.lang']._activate_lang(code)
-        Translations = self.env['ir.translation']
-        for source, value in tnx:
-            Translations.create({
-                'name': name,
-                'lang': code,
-                'type': type,
-                'src': source,
-                'value': value,
-                'state': 'translated',
-            })
 
 
 class test_ids_stuff(ImporterCase):
@@ -153,18 +141,14 @@ class test_boolean_field(ImporterCase):
         ], values(records))
 
     def test_falses(self):
-        for lang, source, value in [('fr_FR', 'no', u'non'),
-                                    ('de_DE', 'no', u'nein'),
-                                    ('ru_RU', 'no', u'нет'),
-                                    ('nl_BE', 'false', u'vals'),
-                                    ('lt_LT', 'false', u'klaidingas')]:
-            self.add_translations('test_import.py', 'code', lang, (source, value))
+        for lang in ['fr_FR', 'de_DE', 'ru_RU', 'nl_BE', 'lt_LT']:
+            self.env['res.lang']._activate_lang(lang)
         falses = [[u'0'], [u'no'], [u'false'], [u'FALSE'], [u''],
-                  [u'non'], # no, fr
-                  [u'nein'], # no, de
-                  [u'нет'], # no, ru
-                  [u'vals'], # false, nl
-                  [u'klaidingas'], # false, lt,
+                  [u'faux'], # false, fr
+                  [u'falsch'], # false, de
+                  [u'ложь'], # no, ru
+                  [u'onwaar'], # false, nl
+                  [u'ne'], # false, lt,
         ]
 
         result = self.import_(['value'], falses)
@@ -448,11 +432,11 @@ class test_text(ImporterCase):
 
 class test_selection(ImporterCase):
     model_name = 'export.selection'
-    translations_fr = [
-        ("Foo", "tete"),
-        ("Bar", "titi"),
-        ("Qux", "toto"),
-    ]
+    translations_fr = {
+        "Foo": "tete",
+        "Bar": "titi",
+        "Qux": "toto",
+    }
 
     def test_imported(self):
         result = self.import_(['value'], [
@@ -466,8 +450,11 @@ class test_selection(ImporterCase):
         self.assertEqual(['3', '2', '1', '2'], values(self.read()))
 
     def test_imported_translated(self):
-        self.add_translations(
-            'ir.model.fields.selection,name', 'model', 'fr_FR', *self.translations_fr)
+        self.env['res.lang']._activate_lang('fr_FR')
+        # add translations for selection
+        selections = self.env['ir.model.fields.selection'].search([('name', 'in', list(self.translations_fr))])
+        for selection in selections:
+            selection.with_context(lang='fr_FR').name = self.translations_fr[selection.name]
 
         result = self.import_(['value'], [
             ['toto'],
@@ -526,12 +513,12 @@ class test_selection_with_default(ImporterCase):
 
 class test_selection_function(ImporterCase):
     model_name = 'export.selection.function'
-    translations_fr = [
-        ("Corge", "toto"),
-        ("Grault", "titi"),
-        ("Wheee", "tete"),
-        ("Moog", "tutu"),
-    ]
+    translations_fr = {
+        "Corge": "toto",
+        "Grault": "titi",
+        "Wheee": "tete",
+        "Moog": "tutu",
+    }
 
     def test_imported(self):
         """ import uses fields_get, so translates import label (may or may not
@@ -550,8 +537,10 @@ class test_selection_function(ImporterCase):
     def test_translated(self):
         """ Expects output of selection function returns translated labels
         """
-        self.add_translations(
-            'ir.model.fields.selection,name', 'model', 'fr_FR', *self.translations_fr)
+        self.env['res.lang']._activate_lang('fr_FR')
+        # hack into code translations
+        code_translations.python_translations[('test_impex', 'fr_FR')] = self.translations_fr
+        self.addCleanup(code_translations.python_translations.pop, ('test_impex', 'fr_FR'))
 
         result = self.import_(['value'], [
             ['titi'],
@@ -573,39 +562,35 @@ class test_m2o(ImporterCase):
         # create integer objects
         record1 = self.env['export.integer'].create({'value': 42})
         record2 = self.env['export.integer'].create({'value': 36})
-        # get its name
-        name1 = dict(record1.name_get())[record1.id]
-        name2 = dict(record2.name_get())[record2.id]
 
         # preheat the oven
         for _ in range(5):
-            self.env.cr.execute('SAVEPOINT xxx')
-            self.import_(['value'], [[name1], [name1], [name2]])
-            self.env.cr.execute('ROLLBACK TO SAVEPOINT xxx')
-            self.env.cr.execute('RELEASE SAVEPOINT xxx')
+            with contextlib.closing(self.env.cr.savepoint(flush=False)):
+                self.import_(['value'], [[record1.display_name], [record1.display_name], [record2.display_name]])
 
-        # 1 x SAVEPOINT model_load
+        # 1 x SAVEPOINT load
         # 3 x name_search
-        # 1 x SAVEPOINT
+        # 1 x SAVEPOINT _load_records
         # 1 x select on list of existing modules
-        # 3 x insert
-        # 1 x RELEASE SAVEPOINT
-        # => 10
-        with self.assertQueryCount(10):
+        # 1 x insert
+        # 1 x RELEASE SAVEPOINT _load_records
+        # 1 x RELEASE SAVEPOINT load
+        # => 9
+        with self.assertQueryCount(9):
             result = self.import_(['value'], [
-                # import by name_get
-                [name1],
-                [name1],
-                [name2],
+                # import by display_name
+                [record1.display_name],
+                [record1.display_name],
+                [record2.display_name],
             ])
 
         self.assertFalse(result['messages'])
         self.assertEqual(len(result['ids']), 3)
         # correct ids assigned to corresponding records
         self.assertEqual([
-            (record1.id, name1),
-            (record1.id, name1),
-            (record2.id, name2),],
+            (record1.id, record1.display_name),
+            (record1.id, record1.display_name),
+            (record2.id, record2.display_name),],
             values(self.read()))
 
     def test_by_xid(self):
@@ -629,19 +614,17 @@ class test_m2o(ImporterCase):
     def test_by_names(self):
         record1 = self.env['export.integer'].create({'value': 42})
         record2 = self.env['export.integer'].create({'value': 42})
-        name1 = dict(record1.name_get())[record1.id]
-        name2 = dict(record2.name_get())[record2.id]
         # names should be the same
-        self.assertEqual(name1, name2)
+        self.assertEqual(record1.display_name, record2.display_name)
 
-        result = self.import_(['value'], [[name2]])
+        result = self.import_(['value'], [[record2.display_name]])
         self.assertEqual(
             result['messages'],
             [message(u"Found multiple matches for value 'export.integer:42' in field 'Value' (2 matches)",
                      type='warning')])
         self.assertEqual(len(result['ids']), 1)
         self.assertEqual([
-            (record1.id, name1)
+            (record1.id, record1.display_name)
         ], values(self.read()))
 
     def test_fail_by_implicit_id(self):
@@ -723,6 +706,13 @@ class test_m2o(ImporterCase):
             u"name, external id or database id")])
         self.assertIs(result['ids'], False)
 
+    def test_fail_id(self):
+        record = self.env['export.integer'].create({'value': 42})
+        result = self.import_(['value/.id'], [["lorem"], [record.id]])
+        self.assertFalse(result['ids'])
+        self.assertTrue(result['messages'])
+        self.assertEqual(result['messages'][0]['message'], "Invalid database id 'lorem' for the field 'Value'")
+
     def test_name_create_enabled_m2o(self):
         result = self.import_(['value'], [[101]])
         self.assertEqual(result['messages'], [message(
@@ -737,6 +727,20 @@ class test_m2o(ImporterCase):
         result = self.import_(['value'], [[101]], context=context)
         self.assertFalse(result['messages'])
         self.assertEqual(len(result['ids']), 1)
+
+    @mute_logger('odoo.sql_db')
+    def test_name_create_enabled_m2o_required_field(self):
+        self.model = self.env['export.many2one.required.subfield']
+        self.env['export.with.required.field'].create({'name': 'ipsum', 'value': 10})
+        context = {'name_create_enabled_fields': {'name': True}}
+        result = self.import_(['name'], [['lorem'], ['ipsum']], context=context)
+        messages = result['messages']
+        self.assertTrue(messages)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]['message'],
+                         "No matching record found for name 'lorem' in field 'Name' and the following error was "
+                         "encountered when we attempted to create one: Cannot create new 'export.with.required.field' "
+                         "records from their name alone. Please create those records manually and try importing again.")
 
 class TestInvalidStrings(ImporterCase):
     model_name = 'export.m2o.str'
@@ -872,7 +876,7 @@ class test_m2m(ImporterCase):
 class test_o2m(ImporterCase):
     model_name = 'export.one2many'
 
-    def test_name_get(self):
+    def test_display_name(self):
         s = u'Java is a DSL for taking large XML files and converting them ' \
             u'to stack traces'
         result = self.import_(
@@ -1046,6 +1050,14 @@ class test_o2m(ImporterCase):
         [b] = self.browse()
         self.assertEqual(b.value.m2o.value, 101)
 
+    def test_escape_m2o_in_o2m(self):
+        result = self.import_(['value/m2o'], [['21%']])
+        self.assertEqual(result['messages'], [message(
+            u"No matching record found for name '21%' "
+            u"in field 'Value/M2O'", moreinfo=moreaction(
+                res_model='export.integer'),
+            field_name='Value', field_path=['value', 'm2o'], field_type='name', value='21%')])
+
 
 class test_o2m_multiple(ImporterCase):
     model_name = 'export.one2many.multiple'
@@ -1124,7 +1136,7 @@ class test_realworld(SavepointCaseWithUserDemo):
         """ The content of the o2m field's dict needs to go through conversion
         as it may be composed of convertables or other relational fields
         """
-        self.env['ir.model.data'].clear_caches()
+        self.env.registry.clear_cache()
         Model = self.env['export.one2many.recursive']
         result = Model.load(
             ['value', 'child/const', 'child/child1/str', 'child/child2/value'],
@@ -1151,7 +1163,7 @@ class test_realworld(SavepointCaseWithUserDemo):
                          [12])
 
     def test_o2m_subfields_fail_by_implicit_id(self):
-        self.env['ir.model.data'].clear_caches()
+        self.env.registry.clear_cache()
         Model = self.env['export.one2many.recursive']
         result = Model.with_context(import_file=True).load(
             ['child/child1/parent_id'],

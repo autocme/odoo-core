@@ -8,12 +8,14 @@ import collections
 import functools
 import io
 import logging
+import mimetypes
 import re
 import zipfile
 
 __all__ = ['guess_mimetype']
 
 _logger = logging.getLogger(__name__)
+MIMETYPE_HEAD_SIZE = 2048
 
 # We define our own guess_mimetype implementation and if magic is available we
 # use it instead.
@@ -109,6 +111,10 @@ def _check_svg(data):
     if b'<svg' in data and b'/svg' in data:
         return 'image/svg+xml'
 
+def _check_webp(data):
+    """This checks the presence of the WEBP and VP8 in the RIFF"""
+    if data[8:15] == b'WEBPVP8':
+        return 'image/webp'
 
 # for "master" formats with many subformats, discriminants is a list of
 # functions, tried in order and the first non-falsy value returned is the
@@ -127,6 +133,9 @@ _mime_mappings = (
         _check_svg,
     ]),
     _Entry('image/x-icon', [b'\x00\x00\x01\x00'], []),
+    _Entry('image/webp', [b'RIFF'], [
+        _check_webp,
+    ]),
     # OLECF files in general (Word, Excel, PPT, default to word because why not?)
     _Entry('application/msword', [b'\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1', b'\x0D\x44\x4F\x43'], [
         _check_olecf
@@ -180,7 +189,7 @@ if magic:
         _guesser = ms.buffer
 
     def guess_mimetype(bin_data, default=None):
-        mimetype = _guesser(bin_data[:1024])
+        mimetype = _guesser(bin_data[:MIMETYPE_HEAD_SIZE])
         # upgrade incorrect mimetype to official one, fixed upstream
         # https://github.com/file/file/commit/1a08bb5c235700ba623ffa6f3c95938fe295b262
         if mimetype == 'image/svg':
@@ -190,20 +199,32 @@ else:
     guess_mimetype = _odoo_guess_mimetype
 
 
-
 def neuter_mimetype(mimetype, user):
     wrong_type = 'ht' in mimetype or 'xml' in mimetype or 'svg' in mimetype
     if wrong_type and not user._is_system():
         return 'text/plain'
     return mimetype
 
-
 def get_extension(filename):
-    """ Return the extension the current filename based on the heuristic that
-    ext is less than or equal to 10 chars and is alphanumeric.
+    # A file has no extension if it has no dot (ignoring the leading one
+    # of hidden files) or that what follow the last dot is not a single
+    # word, e.g. "Mr. Doe"
+    _stem, dot, ext = filename.lstrip('.').rpartition('.')
+    if not dot or not ext.isalnum():
+        return ''
 
-    :param str filename: filename to try and guess a extension for
-    :returns: detected extension or ``
-    """
-    ext = '.' in filename and filename.split('.')[-1]
-    return ext and len(ext) <= 10 and ext.isalnum() and '.' + ext.lower() or ''
+    # Assume all 4-chars extensions to be valid extensions even if it is
+    # not known from the mimetypes database. In /etc/mime.types, only 7%
+    # known extensions are longer.
+    if len(ext) <= 4:
+        return f'.{ext}'.lower()
+
+    # Use the mimetype database to determine the extension of the file.
+    guessed_mimetype, guessed_ext = mimetypes.guess_type(filename)
+    if guessed_ext:
+        return guessed_ext
+    if guessed_mimetype:
+        return f'.{ext}'.lower()
+
+    # Unknown extension.
+    return ''

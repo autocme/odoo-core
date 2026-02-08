@@ -7,7 +7,7 @@ except ImportError:
     magic = None
 
 from odoo.tests.common import BaseCase
-from odoo.tools.mimetypes import guess_mimetype, get_extension
+from odoo.tools.mimetypes import get_extension, guess_mimetype
 
 PNG = b'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVQI12P4//8/AAX+Av7czFnnAAAAAElFTkSuQmCC'
 GIF = b"R0lGODdhAQABAIAAAP///////ywAAAAAAQABAAACAkQBADs="
@@ -25,6 +25,11 @@ SVG = b"""PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iaXNvLTg4NTktMSI/PjwhRE9DVFlQRS
 NAMESPACED_SVG = b"""<svg:svg xmlns:svg="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
   <svg:rect x="10" y="10" width="80" height="80" fill="green" />
 </svg:svg>"""
+
+# single pixel webp image
+WEBP = b"""UklGRjoAAABXRUJQVlA4IC4AAAAwAQCdASoBAAEAAUAmJaAAA3AA/u/uY//8s//2W/7LeM///5Bj
+/dl/pJxGAAAA"""
+
 # minimal zip file with an empty `t.txt` file
 ZIP = b"""UEsDBBQACAAIAGFva1AAAAAAAAAAAAAAAAAFACAAdC50eHRVVA0AB5bgaF6W4GheluBoXnV4CwABBOgDAAAE6AMAAA
 MAUEsHCAAAAAACAAAAAAAAAFBLAQIUAxQACAAIAGFva1AAAAAAAgAAAAAAAAAFACAAAAAAAAAAAACkgQAAAAB0LnR4dFVUDQAHlu
@@ -105,20 +110,26 @@ class test_guess_mimetype(BaseCase):
             self.assertNotIn("svg", mimetype)
 
 
+    def test_mimetype_webp(self):
+        content = base64.b64decode(WEBP)
+        mimetype = guess_mimetype(content, default='test')
+        self.assertEqual(mimetype, 'image/webp')
+
     def test_mimetype_zip(self):
         content = base64.b64decode(ZIP)
         mimetype = guess_mimetype(content, default='test')
         self.assertEqual(mimetype, 'application/zip')
 
     def test_mimetype_xml(self):
+        expected_mimetype = 'application/xml' if magic is None else 'text/xml'
         mimetype = guess_mimetype(XML, default='test')
-        self.assertEqual(mimetype, 'application/xml')
+        self.assertEqual(mimetype, expected_mimetype)
 
     def test_mimetype_get_extension(self):
         self.assertEqual(get_extension('filename.Abc'), '.abc')
         self.assertEqual(get_extension('filename.scss'), '.scss')
         self.assertEqual(get_extension('filename.torrent'), '.torrent')
-        self.assertEqual(get_extension('.htaccess'), '.htaccess')
+        self.assertEqual(get_extension('.htaccess'), '')
         # enough to suppose that extension is present and don't suffix the filename
         self.assertEqual(get_extension('filename.tar.gz'), '.gz')
         self.assertEqual(get_extension('filename'), '')
@@ -126,8 +137,3 @@ class test_guess_mimetype(BaseCase):
         self.assertEqual(get_extension('filename.not_alnum'), '')
         self.assertEqual(get_extension('filename.with space'), '')
         self.assertEqual(get_extension('filename.notAnExtension'), '')
-
-
-
-if __name__ == '__main__':
-    unittest.main()

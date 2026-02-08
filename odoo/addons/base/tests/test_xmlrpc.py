@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
+import collections
 import time
 from xmlrpc.client import Binary
 
 from odoo.exceptions import AccessDenied, AccessError
 from odoo.http import _request_stack
 
+import odoo
 import odoo.tools
 from odoo.tests import common
 from odoo.service import common as auth, model
@@ -73,6 +75,15 @@ class TestXMLRPC(common.HttpCase):
         self.assertEqual(ctx['lang'], 'en_US')
         self.assertEqual(ctx['tz'], 'Europe/Brussels')
 
+    def test_xmlrpc_defaultdict_marshalling(self):
+        """
+        Test that the marshalling of a collections.defaultdict object
+        works properly over XMLRPC
+        """
+        self.patch(self.registry['res.users'], 'context_get',
+                   odoo.api.model(lambda *_: collections.defaultdict(int)))
+        self.assertEqual(self.xmlrpc('res.users', 'context_get'), {})
+
     def test_xmlrpc_remove_control_characters(self):
         record = self.env['res.users'].create({
             'name': 'bob with a control character: \x03',
@@ -131,15 +142,21 @@ class TestAPIKeys(common.HttpCase):
 
     def setUp(self):
         super().setUp()
+
+        def get_json_data():
+            raise ValueError("There is no json here")
         # needs a fake request in order to call methods protected with check_identity
         fake_req = DotDict({
             # various things go and access request items
             'httprequest': DotDict({
                 'environ': {'REMOTE_ADDR': 'localhost'},
                 'cookies': {},
+                'args': {},
             }),
             # bypass check_identity flow
-            'session': {'identity-check-last': time.time()}
+            'session': {'identity-check-last': time.time()},
+            'geoip': {},
+            'get_json_data': get_json_data,
         })
         _request_stack.push(fake_req)
         self.addCleanup(_request_stack.pop)

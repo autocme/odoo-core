@@ -11,7 +11,7 @@ class IrFilters(models.Model):
     _description = 'Filters'
     _order = 'model_id, name, id desc'
 
-    name = fields.Char(string='Filter Name', translate=True, required=True)
+    name = fields.Char(string='Filter Name', required=True)
     user_id = fields.Many2one('res.users', string='User', ondelete='cascade',
                               help="The user this filter is private to. When left empty the filter is public "
                                    "and available to all users.")
@@ -28,7 +28,11 @@ class IrFilters(models.Model):
 
     @api.model
     def _list_all_models(self):
-        self._cr.execute("SELECT model, name FROM ir_model ORDER BY name")
+        lang = self.env.lang or 'en_US'
+        self._cr.execute(
+            "SELECT model, COALESCE(name->>%s, name->>'en_US') FROM ir_model ORDER BY 2",
+            [lang],
+        )
         return self._cr.fetchall()
 
     def write(self, vals):
@@ -62,6 +66,7 @@ class IrFilters(models.Model):
     def get_filters(self, model, action_id=None):
         """Obtain the list of filters available for the user on the given model.
 
+        :param int model: id of model to find filters for
         :param action_id: optional ID of action to restrict filters to this action
             plus global filters. If missing only global filters are returned.
             The action does not have to correspond to the model, it may only be
@@ -72,10 +77,12 @@ class IrFilters(models.Model):
         """
         # available filters: private filters (user_id=uid) and public filters (uid=NULL),
         # and filters for the action (action_id=action_id) or global (action_id=NULL)
-        action_domain = self._get_action_domain(action_id)
-        filters = self.search(action_domain + [('model_id', '=', model), ('user_id', 'in', [self._uid, False])])
         user_context = self.env['res.users'].context_get()
-        return filters.with_context(user_context).read(['name', 'is_default', 'domain', 'context', 'user_id', 'sort'])
+        action_domain = self._get_action_domain(action_id)
+        return self.with_context(user_context).search_read(
+            action_domain + [('model_id', '=', model), ('user_id', 'in', [self._uid, False])],
+            ['name', 'is_default', 'domain', 'context', 'user_id', 'sort'],
+        )
 
     @api.model
     def _check_global_default(self, vals, matching_filters):
@@ -106,7 +113,7 @@ class IrFilters(models.Model):
         if matching_filters and (matching_filters[0]['id'] == defaults.id):
             return
 
-        raise UserError(_("There is already a shared filter set as default for %(model)s, delete or change it before setting a new default") % {'model': vals.get('model_id')})
+        raise UserError(_("There is already a shared filter set as default for %(model)s, delete or change it before setting a new default", model=vals.get('model_id')))
 
     @api.model
     @api.returns('self', lambda value: value.id)
@@ -148,12 +155,12 @@ class IrFilters(models.Model):
         # Partial constraint, complemented by unique index (see below). Still
         # useful to keep because it provides a proper error message when a
         # violation occurs, as it shares the same prefix as the unique index.
-        ('name_model_uid_unique', 'unique (name, model_id, user_id, action_id)', 'Filter names must be unique'),
+        ('name_model_uid_unique', 'unique (model_id, user_id, action_id, name)', 'Filter names must be unique'),
     ]
 
     def _auto_init(self):
         result = super(IrFilters, self)._auto_init()
         # Use unique index to implement unique constraint on the lowercase name (not possible using a constraint)
         tools.create_unique_index(self._cr, 'ir_filters_name_model_uid_unique_action_index',
-            self._table, ['lower(name)', 'model_id', 'COALESCE(user_id,-1)', 'COALESCE(action_id,-1)'])
+            self._table, ['model_id', 'COALESCE(user_id,-1)', 'COALESCE(action_id,-1)', 'lower(name)'])
         return result

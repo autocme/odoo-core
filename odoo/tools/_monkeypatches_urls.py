@@ -64,7 +64,6 @@ _always_safe_chars = (
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     "0123456789"
     "-._~"
-    "$!'()*+,;"  # RFC3986 sub-delims set, not including query string delimiters &=
 )
 _always_safe = frozenset(_always_safe_chars.encode("ascii"))
 
@@ -1039,6 +1038,7 @@ urls.url_encode = url_encode
 urls.url_join = url_join
 urls.url_parse = url_parse
 urls.url_quote = url_quote
+urls.url_unquote = url_unquote
 urls.url_quote_plus = url_quote_plus
 urls.url_unquote_plus = url_unquote_plus
 urls.url_unparse = url_unparse

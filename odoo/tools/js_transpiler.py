@@ -1,8 +1,8 @@
 """
 This code is what let us use ES6-style modules in odoo.
-Classic Odoo modules are composed of a top-level :samp:`odoo.define({name},{body_function})` call.
+Classic Odoo modules are composed of a top-level :samp:`odoo.define({name},{dependencies},{body_function})` call.
 This processor will take files starting with an `@odoo-module` annotation (in a comment) and convert them to classic modules.
-If any file has the /** odoo-module */ on top of it, it will get processed by this class.
+If any file has the ``/** odoo-module */`` on top of it, it will get processed by this class.
 It performs several operations to get from ES6 syntax to the usual odoo one with minimal changes.
 This is done on the fly, this not a pre-processing tool.
 
@@ -12,8 +12,12 @@ the original source need to be supported by the browsers.
 """
 
 import re
+import logging
 from functools import partial
 
+from odoo.tools.misc import OrderedSet
+
+_logger = logging.getLogger(__name__)
 
 def transpile_javascript(url, content):
     """
@@ -25,24 +29,27 @@ def transpile_javascript(url, content):
     """
     module_path = url_to_module_path(url)
     legacy_odoo_define = get_aliased_odoo_define_content(module_path, content)
-
+    dependencies = OrderedSet()
     # The order of the operations does sometimes matter.
     steps = [
         convert_legacy_default_import,
         convert_basic_import,
+        convert_default_and_named_import,
+        convert_default_and_star_import,
         convert_default_import,
         convert_star_import,
         convert_unnamed_relative_import,
         convert_from_export,
         convert_star_from_export,
-        partial(convert_relative_require, url),
         remove_index,
+        partial(convert_relative_require, url, dependencies),
         convert_export_function,
         convert_export_class,
         convert_variable_export,
         convert_object_export,
         convert_default_export,
-        partial(wrap_with_odoo_define, module_path),
+        partial(wrap_with_qunit_module, url),
+        partial(wrap_with_odoo_define, module_path, dependencies),
     ]
     for s in steps:
         content = s(content)
@@ -61,7 +68,7 @@ URL_RE = re.compile(r"""
 
 def url_to_module_path(url):
     """
-    Odoo modules each have a name. (odoo.define("<the name>", async function (require) {...});
+    Odoo modules each have a name. (odoo.define("<the name>", [<dependencies>], function (require) {...});
     It is used in to be required later. (const { something } = require("<the name>").
     The transpiler transforms the url of the file in the project to this name.
     It takes the module name and add a @ on the start of it, and map it to be the source of the static/src (or
@@ -90,13 +97,23 @@ def url_to_module_path(url):
     else:
         raise ValueError("The js file %r must be in the folder '/static/src' or '/static/lib' or '/static/test'" % url)
 
+def wrap_with_qunit_module(url, content):
+    """
+    Wraps the test file content (source code) with the QUnit.module('module_name', function() {...}).
+    """
+    if "tests" in url and re.search(r'QUnit\.(test|debug|only)\(', content):
+        match = URL_RE.match(url)
+        return f"""QUnit.module("{match["module"]}", function() {{{content}}});"""
+    else:
+        return content
 
-def wrap_with_odoo_define(module_path, content):
+def wrap_with_odoo_define(module_path, dependencies, content):
     """
     Wraps the current content (source code) with the odoo.define call.
+    It adds as a second argument the list of dependencies.
     Should logically be called once all other operations have been performed.
     """
-    return f"""odoo.define({module_path!r}, async function (require) {{
+    return f"""odoo.define({module_path!r}, {list(dependencies)}, function (require) {{
 'use strict';
 let __exports = {{}};
 {content}
@@ -385,7 +402,7 @@ IMPORT_BASIC_RE = re.compile(r"""
     ^
     (?P<space>\s*)                      # space and empty line
     import\s+                           # import
-    (?P<object>{(\s*\w+\s*,?\s*)+})\s*  # { a, b, c as x, ... }
+    (?P<object>{[\s\w,]+})\s*           # { a, b, c as x, ... }
     from\s*                             # from
     (?P<path>(?P<quote>["'`])([^"'`]+)(?P=quote))   # "file path" ("some/path")
     """, re.MULTILINE | re.VERBOSE)
@@ -460,15 +477,54 @@ def convert_default_import(content):
     return IMPORT_DEFAULT.sub(repl, content)
 
 
+IS_PATH_LEGACY_RE = re.compile(r"""(?P<quote>["'`])([^@\."'`][^"'`]*)(?P=quote)""")
+
+IMPORT_DEFAULT_AND_NAMED_RE = re.compile(r"""
+    ^
+    (?P<space>\s*)                                  # space and empty line
+    import\s+                                       # import
+    (?P<default_export>\w+)\s*,\s*                  # default variable name,
+    (?P<named_exports>{[\s\w,]+})\s*                # { a, b, c as x, ... }
+    from\s*                                         # from
+    (?P<path>(?P<quote>["'`])([^"'`]+)(?P=quote))   # "file path" ("some/path")
+    """, re.MULTILINE | re.VERBOSE)
+
+
+def convert_default_and_named_import(content):
+    """
+    Transpile default and named import on one line.
+
+    .. code-block:: javascript
+
+        // before
+        import something, { a } from "some/path";
+        import somethingElse, { b } from "legacy.module";
+        // after
+        const { [Symbol.for("default")]: something, a } = require("some/path");
+        const somethingElse = require("legacy.module");
+        const { b } = somethingElse;
+    """
+    def repl(matchobj):
+        is_legacy = IS_PATH_LEGACY_RE.match(matchobj['path'])
+        new_object = matchobj["named_exports"].replace(" as ", ": ")
+        if is_legacy:
+            return f"""{matchobj['space']}const {matchobj['default_export']} = require({matchobj['path']});
+{matchobj['space']}const {new_object} = {matchobj['default_export']}"""
+        new_object = f"""{{ [Symbol.for("default")]: {matchobj['default_export']},{new_object[1:]}"""
+        return f"{matchobj['space']}const {new_object} = require({matchobj['path']})"
+    return IMPORT_DEFAULT_AND_NAMED_RE.sub(repl, content)
+
+
 RELATIVE_REQUIRE_RE = re.compile(r"""
-    require\((?P<quote>["'`])([^@"'`]+)(?P=quote)\)  # require("some/path")
-    """, re.VERBOSE)
+    ^[^/*\n]*require\((?P<quote>[\"'`])([^\"'`]+)(?P=quote)\) # require("some/path")
+    """, re.MULTILINE | re.VERBOSE)
 
 
-def convert_relative_require(url, content):
+def convert_relative_require(url, dependencies, content):
     """
     Convert the relative path contained in a 'require()'
-    to the new path system (@module/path)
+    to the new path system (@module/path).
+    Adds all modules path to dependencies.
     .. code-block:: javascript
 
         // Relative path:
@@ -485,10 +541,13 @@ def convert_relative_require(url, content):
     """
     new_content = content
     for quote, path in RELATIVE_REQUIRE_RE.findall(new_content):
+        module_path = path
         if path.startswith(".") and "/" in path:
             pattern = rf"require\({quote}{path}{quote}\)"
-            repl = f'require("{relative_path_to_module_path(url, path)}")'
+            module_path = relative_path_to_module_path(url, path)
+            repl = f'require("{module_path}")'
             new_content = re.sub(pattern, repl, new_content)
+        dependencies.add(module_path)
     return new_content
 
 
@@ -516,6 +575,34 @@ def convert_star_import(content):
     return IMPORT_STAR.sub(repl, content)
 
 
+IMPORT_DEFAULT_AND_STAR = re.compile(r"""
+    ^(?P<space>\s*)                 # indentation
+    import\s+                       # import
+    (?P<default_export>\w+)\s*,\s*  # default export name,
+    \*\s+as\s+                      # * as
+    (?P<named_exports_alias>\w+)    # alias
+    \s*from\s*                      # from
+    (?P<path>[^;\n]+)               # path
+""", re.MULTILINE | re.VERBOSE)
+
+
+def convert_default_and_star_import(content):
+    """
+    Transpile import star.
+
+    .. code-block:: javascript
+
+        // before
+        import something, * as name from "some/path";
+        // after
+        const name = require("some/path");
+        const something = name[Symbol.for("default")];
+    """
+    repl = r"""\g<space>const \g<named_exports_alias> = require(\g<path>);
+\g<space>const \g<default_export> = \g<named_exports_alias>[Symbol.for("default")]"""
+    return IMPORT_DEFAULT_AND_STAR.sub(repl, content)
+
+
 IMPORT_UNNAMED_RELATIVE_RE = re.compile(r"""
     ^(?P<space>\s*)     # indentation
     import\s+           # import
@@ -534,7 +621,7 @@ def convert_unnamed_relative_import(content):
         // after
         require("some/path")
     """
-    repl = r"require(\g<path>)"
+    repl = r"\g<space>require(\g<path>)"
     return IMPORT_UNNAMED_RELATIVE_RE.sub(repl, content)
 
 
@@ -560,9 +647,10 @@ def remove_index(content):
 
 
 def relative_path_to_module_path(url, path_rel):
-    """
-    Convert the relative path into a module path, which is more generic and fancy.
+    """Convert the relative path into a module path, which is more generic and
+    fancy.
 
+    :param str url:
     :param path_rel: a relative path to the current url.
     :return: module path (@module/...)
     """
@@ -606,7 +694,7 @@ def get_aliased_odoo_define_content(module_path, content):
     we have a problem when we will have converted to module to ES6: its new name will be more like
     "web/chrome/abstract_action". So the require would fail !
     So we add a second small modules, an alias, as such:
-    > odoo.define("web/chrome/abstract_action", async function(require) {
+    > odoo.define("web/chrome/abstract_action", ['web.AbstractAction'], function (require) {
     >  return require('web.AbstractAction')[Symbol.for("default")];
     > });
 
@@ -636,13 +724,13 @@ def get_aliased_odoo_define_content(module_path, content):
         alias = matchobj['alias']
         if alias:
             if matchobj['default']:
-                return """\nodoo.define(`%s`, async function(require) {
+                return """\nodoo.define(`%s`, ['%s'], function (require) {
                         return require('%s');
-                        });\n""" % (alias, module_path)
+                        });\n""" % (alias, module_path, module_path)
             else:
-                return """\nodoo.define(`%s`, async function(require) {
+                return """\nodoo.define(`%s`, ['%s'], function (require) {
                         return require('%s')[Symbol.for("default")];
-                        });\n""" % (alias, module_path)
+                        });\n""" % (alias, module_path, module_path)
 
 
 def convert_as(val):

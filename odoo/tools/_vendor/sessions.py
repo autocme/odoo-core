@@ -15,18 +15,18 @@ r"""
     :copyright: 2007 Pallets
     :license: BSD-3-Clause
 """
+import logging
 import os
 import re
 import tempfile
 from hashlib import sha1
 from os import path, replace as rename
-from pickle import dump
-from pickle import HIGHEST_PROTOCOL
-from pickle import load
+from odoo.tools.misc import pickle
 from time import time
 
 from werkzeug.datastructures import CallbackDict
 
+_logger = logging.getLogger(__name__)
 _sha1_re = re.compile(r"^[a-f0-9]{40}$")
 
 
@@ -37,7 +37,7 @@ def generate_key(salt=None):
 
 
 class ModificationTrackingDict(CallbackDict):
-    __slots__ = ("modified",)
+    __slots__ = ("modified", "on_update")
 
     def __init__(self, *args, **kwargs):
         def on_update(self):
@@ -193,7 +193,7 @@ class FilesystemSessionStore(SessionStore):
         fd, tmp = tempfile.mkstemp(suffix=_fs_transaction_suffix, dir=self.path)
         f = os.fdopen(fd, "wb")
         try:
-            dump(dict(session), f, HIGHEST_PROTOCOL)
+            pickle.dump(dict(session), f, pickle.HIGHEST_PROTOCOL)
         finally:
             f.close()
         try:
@@ -215,14 +215,16 @@ class FilesystemSessionStore(SessionStore):
         try:
             f = open(self.get_session_filename(sid), "rb")
         except IOError:
+            _logger.debug('Could not load session from disk. Use empty session.', exc_info=True)
             if self.renew_missing:
                 return self.new()
             data = {}
         else:
             try:
                 try:
-                    data = load(f)
+                    data = pickle.load(f, errors={})
                 except Exception:
+                    _logger.debug('Could not load session data. Use empty session.', exc_info=True)
                     data = {}
             finally:
                 f.close()

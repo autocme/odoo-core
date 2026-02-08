@@ -21,6 +21,7 @@ class Lang(models.Model):
     _name = "res.lang"
     _description = "Languages"
     _order = "active desc,name"
+    _allow_sudo_commands = False
 
     _disallowed_datetime_patterns = list(tools.DATETIME_FORMATS_MAP)
     _disallowed_datetime_patterns.remove('%y') # this one is in fact allowed, just not good practice
@@ -60,9 +61,9 @@ class Lang(models.Model):
     flag_image_url = fields.Char(compute=_compute_field_flag_image_url)
 
     _sql_constraints = [
-        ('name_uniq', 'unique(name)', 'The name of the language must be unique !'),
-        ('code_uniq', 'unique(code)', 'The code of the language must be unique !'),
-        ('url_code_uniq', 'unique(url_code)', 'The URL code of the language must be unique !'),
+        ('name_uniq', 'unique(name)', 'The name of the language must be unique!'),
+        ('code_uniq', 'unique(code)', 'The code of the language must be unique!'),
+        ('url_code_uniq', 'unique(url_code)', 'The URL code of the language must be unique!'),
     ]
 
     @api.constrains('active')
@@ -81,6 +82,23 @@ class Lang(models.Model):
                                             'Please refer to the list of allowed directives, '
                                             'displayed when you edit a language.'))
 
+    @api.onchange('time_format', 'date_format')
+    def _onchange_format(self):
+        warning = {
+            'warning': {
+                'title': _("Using 24-hour clock format with AM/PM can cause issues."),
+                'message': _("Changing to 12-hour clock format instead."),
+                'type': 'notification'
+            }
+        }
+        for lang in self:
+            if lang.date_format and "%H" in lang.date_format and "%p" in lang.date_format:
+                lang.date_format = lang.date_format.replace("%H", "%I")
+                return warning
+            if lang.time_format and "%H" in lang.time_format and "%p" in lang.time_format:
+                lang.time_format = lang.time_format.replace("%H", "%I")
+                return warning
+
     @api.constrains('grouping')
     def _check_grouping(self):
         warning = _('The Separator Format should be like [,n] where 0 < n :starting from Unit digit. '
@@ -98,12 +116,6 @@ class Lang(models.Model):
         # check that there is at least one active language
         if not self.search_count([]):
             _logger.error("No language is active.")
-
-    # TODO remove me after v14
-    def load_lang(self, lang, lang_name=None):
-        _logger.warning("Call to deprecated method load_lang, use _create_lang or _activate_lang instead")
-        language = self._activate_lang(lang) or self._create_lang(lang, lang_name)
-        return language.id
 
     def _activate_lang(self, code):
         """ Activate languages
@@ -188,7 +200,7 @@ class Lang(models.Model):
         lang_code = (tools.config.get('load_language') or 'en_US').split(',')[0]
         lang = self._activate_lang(lang_code) or self._create_lang(lang_code)
         IrDefault = self.env['ir.default']
-        default_value = IrDefault.get('res.partner', 'lang')
+        default_value = IrDefault._get('res.partner', 'lang')
         if default_value is None:
             IrDefault.set('res.partner', 'lang', lang_code)
             # set language of main company, created directly by db bootstrap SQL
@@ -200,6 +212,10 @@ class Lang(models.Model):
     @tools.ormcache('code')
     def _lang_get_id(self, code):
         return self.with_context(active_test=True).search([('code', '=', code)]).id
+
+    @tools.ormcache('code')
+    def _lang_get_direction(self, code):
+        return self.with_context(active_test=True).search([('code', '=', code)]).direction
 
     @tools.ormcache('url_code')
     def _lang_get_code(self, url_code):
@@ -266,7 +282,7 @@ class Lang(models.Model):
 
     @api.model_create_multi
     def create(self, vals_list):
-        self.clear_caches()
+        self.env.registry.clear_cache()
         for vals in vals_list:
             if not vals.get('url_code'):
                 vals['url_code'] = vals.get('iso_code') or vals['code']
@@ -277,18 +293,18 @@ class Lang(models.Model):
         if 'code' in vals and any(code != vals['code'] for code in lang_codes):
             raise UserError(_("Language code cannot be modified."))
         if vals.get('active') == False:
-            if self.env['res.users'].with_context(active_test=True).search_count([('lang', 'in', lang_codes)]):
+            if self.env['res.users'].with_context(active_test=True).search_count([('lang', 'in', lang_codes)], limit=1):
                 raise UserError(_("Cannot deactivate a language that is currently used by users."))
-            if self.env['res.partner'].with_context(active_test=True).search_count([('lang', 'in', lang_codes)]):
+            if self.env['res.partner'].with_context(active_test=True).search_count([('lang', 'in', lang_codes)], limit=1):
                 raise UserError(_("Cannot deactivate a language that is currently used by contacts."))
-            if self.env['res.users'].with_context(active_test=False).search_count([('lang', 'in', lang_codes)]):
+            if self.env['res.users'].with_context(active_test=False).search_count([('lang', 'in', lang_codes)], limit=1):
                 raise UserError(_("You cannot archive the language in which Odoo was setup as it is used by automated processes."))
             # delete linked ir.default specifying default partner's language
             self.env['ir.default'].discard_values('res.partner', 'lang', lang_codes)
 
         res = super(Lang, self).write(vals)
-        self.flush()
-        self.clear_caches()
+        self.env.flush_all()
+        self.env.registry.clear_cache()
         return res
 
     @api.ondelete(at_uninstall=True)
@@ -303,10 +319,19 @@ class Lang(models.Model):
                 raise UserError(_("You cannot delete the language which is Active!\nPlease de-activate the language first."))
 
     def unlink(self):
-        for language in self:
-            self.env['ir.translation'].search([('lang', '=', language.code)]).unlink()
-        self.clear_caches()
+        self.env.registry.clear_cache()
         return super(Lang, self).unlink()
+
+    def copy_data(self, default=None):
+        default = dict(default or {})
+
+        if "name" not in default:
+            default["name"] = _("%s (copy)", self.name)
+        if "code" not in default:
+            default["code"] = _("%s (copy)", self.code)
+        if "url_code" not in default:
+            default["url_code"] = _("%s (copy)", self.url_code)
+        return super().copy_data(default=default)
 
     def format(self, percent, value, grouping=False, monetary=False):
         """ Format() will return the language-specific output for float values"""
@@ -332,16 +357,23 @@ class Lang(models.Model):
 
         return formatted
 
-    def copy_data(self, default=None):
-        default = dict(default or {})
+    def action_activate_langs(self):
+        """ Activate the selected languages """
+        for lang in self.filtered(lambda l: not l.active):
+            lang.toggle_active()
+        message = _("The languages that you selected have been successfully installed. Users can choose their favorite language in their preferences.")
+        return {
+            'type': 'ir.actions.client',
+            'tag': 'display_notification',
+            'target': 'new',
+            'params': {
+                'message': message,
+                'type': 'success',
+                'sticky': False,
+                'next': {'type': 'ir.actions.act_window_close'},
+            }
+        }
 
-        if "name" not in default:
-            default["name"] = _("%s (copy)", self.name)
-        if "code" not in default:
-            default["code"] = _("%s (copy)", self.code)
-        if "url_code" not in default:
-            default["url_code"] = _("%s (copy)", self.url_code)
-        return super().copy_data(default=default)
 
 def split(l, counts):
     """

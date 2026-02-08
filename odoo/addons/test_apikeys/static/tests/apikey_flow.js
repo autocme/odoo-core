@@ -1,15 +1,11 @@
-odoo.define('test_apikeys.tour', function(require) {
-"use strict";
+/** @odoo-module **/
 
-const tour = require('web_tour.tour');
-const ajax = require('web.ajax');
+import { jsonrpc } from "@web/core/network/rpc_service";
+import { registry } from "@web/core/registry";
 
-tour.register('apikeys_tour_setup', {
-    test: true,
-    url: '/web?debug=1', // Needed as API key part is now only displayed in debug mode
-}, [{
+const openUserPreferenceSecurity = () => [{
     content: 'Open user account menu',
-    trigger: '.o_user_menu .oe_topbar_name',
+    trigger: '.o_user_menu .dropdown-toggle',
     run: 'click',
 }, {
     content: "Open preferences / profile screen",
@@ -19,7 +15,13 @@ tour.register('apikeys_tour_setup', {
     content: "Switch to security tab",
     trigger: 'a[role=tab]:contains("Account Security")',
     run: 'click',
-}, {
+}]
+
+registry.category("web_tour.tours").add('apikeys_tour_setup', {
+    test: true,
+    url: '/web?debug=1', // Needed as API key part is now only displayed in debug mode
+    steps: () => [
+    ...openUserPreferenceSecurity(), {
     content: "Open API keys wizard",
     trigger: 'button:contains("New API Key")',
 }, {
@@ -28,8 +30,8 @@ tour.register('apikeys_tour_setup', {
     run: () => {},
 }, {
     content: "Input password",
-    trigger: '[name=password]',
-    run: 'text demo', // FIXME: better way to do this?
+    trigger: '[name=password] input',
+    run: 'text test_user', // FIXME: better way to do this?
 }, {
     content: "Confirm",
     trigger: "button:contains(Confirm Password)",
@@ -39,7 +41,7 @@ tour.register('apikeys_tour_setup', {
     run: () => {},
 }, {
     content: "Enter description",
-    trigger: 'input[name=name]',
+    trigger: '[name=name] input',
     run: 'text my key',
 }, {
     content: "Confirm key creation",
@@ -48,54 +50,39 @@ tour.register('apikeys_tour_setup', {
     content: "Check that we're on the last step & grab key",
     trigger: 'p:contains("Here is your new API key")',
     run: async () => {
-        const key = $('code span[name=key]').text();
-        await ajax.jsonRpc('/web/dataset/call', 'call', {
+        const key = $('code [name=key] span').text();
+        await jsonrpc('/web/dataset/call_kw', {
             model: 'ir.logging', method: 'send_key',
             args: [key],
+            kwargs: {},
         });
         $('button:contains("Done")').click();
     }
-}, {
-    content: 'Re-open preferences',
-    trigger: '.o_user_menu .oe_topbar_name',
-}, {
-    trigger: '[data-menu=settings]',
-}, {
-    content: "Switch to security tab",
-    trigger: 'a[role=tab]:contains("Account Security")',
-    run: 'click',
-}, {
+},  ...openUserPreferenceSecurity(), {
     content: "check that our key is present",
     trigger: '[name=api_key_ids] td:contains("my key")',
-}]);
+    run() {},
+}]});
 
 // deletes the previously created key
-tour.register('apikeys_tour_teardown', {
+registry.category("web_tour.tours").add('apikeys_tour_teardown', {
     test: true,
     url: '/web?debug=1', // Needed as API key part is now only displayed in debug mode
-}, [{
-    content: 'Open preferences',
-    trigger: '.o_user_menu .oe_topbar_name',
-}, {
-    trigger: '[data-menu=settings]',
-}, {
-    content: "Switch to security tab",
-    trigger: 'a[role=tab]:contains("Account Security")',
-    run: 'click',
-}, {
+    steps: () => [
+    ...openUserPreferenceSecurity(), {
     content: "delete key",
     trigger: '[name=api_key_ids] i.fa-trash',
     run: 'click',
 }, {
     content: "Input password for security mode again",
-    trigger: '[name=password]',
-    run: 'text demo', // FIXME: better way to do this?
+    trigger: '[name=password] input',
+    run: 'text test_user', // FIXME: better way to do this?
 }, {
     content: "And confirm",
     trigger: 'button:contains(Confirm Password)',
 }, {
     content: 'Re-open preferences again',
-    trigger: '.o_user_menu .oe_topbar_name',
+    trigger: '.o_user_menu .dropdown-toggle',
 }, {
     trigger: '[data-menu=settings]',
 }, {
@@ -110,5 +97,4 @@ tour.register('apikeys_tour_teardown', {
             throw new Error("Expected API keys to be hidden (because empty), but it's not");
         };
     }
-}]);
-});
+}]});

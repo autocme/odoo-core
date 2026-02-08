@@ -4,12 +4,40 @@ from lxml.builder import E
 import copy
 import itertools
 import logging
+import re
 
 from odoo.tools.translate import _
 from odoo.tools import SKIPPED_ELEMENT_TYPES, html_escape
 from odoo.exceptions import ValidationError
 
 _logger = logging.getLogger(__name__)
+RSTRIP_REGEXP = re.compile(r'\n[ \t]*$')
+
+def add_stripped_items_before(node, spec, extract):
+    text = spec.text or ''
+
+    before_text = ''
+    prev = next((n for n in node.itersiblings(preceding=True) if not (n.tag == etree.ProcessingInstruction and n.target == "apply-inheritance-specs-node-removal")), None)
+    if prev is None:
+        parent = node.getparent()
+        result = parent.text and RSTRIP_REGEXP.search(parent.text)
+        before_text = result.group(0) if result else ''
+        fallback_text = None if spec.text is None else ''
+        parent.text = ((parent.text or '').rstrip() + text) or fallback_text
+    else:
+        result = prev.tail and RSTRIP_REGEXP.search(prev.tail)
+        before_text = result.group(0) if result else ''
+        prev.tail = (prev.tail or '').rstrip() + text
+
+    if len(spec) > 0:
+        spec[-1].tail = (spec[-1].tail or "").rstrip() + before_text
+    else:
+        spec.text = (spec.text or "").rstrip() + before_text
+
+    for child in spec:
+        if child.get('position') == 'move':
+            child = extract(child)
+        node.addprevious(child)
 
 
 def add_text_before(node, text):
@@ -21,17 +49,7 @@ def add_text_before(node, text):
         prev.tail = (prev.tail or "") + text
     else:
         parent = node.getparent()
-        parent.text = (parent.text or "") + text
-
-
-def add_text_inside(node, text):
-    """ Add text inside ``node``. """
-    if text is None:
-        return
-    if len(node):
-        node[-1].tail = (node[-1].tail or "") + text
-    else:
-        node.text = (node.text or "") + text
+        parent.text = (parent.text or "").rstrip() + text
 
 
 def remove_element(node):
@@ -72,13 +90,7 @@ def locate_node(arch, spec):
         return None
 
     for node in arch.iter(spec.tag):
-        if isinstance(node, SKIPPED_ELEMENT_TYPES):
-            continue
-        if all(node.get(attr) == spec.get(attr) for attr in spec.attrib
-               if attr not in ('position', 'version')):
-            # Version spec should match parent's root element's version
-            if spec.get('version') and spec.get('version') != arch.get('version'):
-                return None
+        if all(node.get(attr) == spec.get(attr) for attr in spec.attrib if attr != 'position'):
             return node
     return None
 
@@ -138,7 +150,14 @@ def apply_inheritance_specs(source, specs_tree, inherit_branding=False, pre_loca
                 if mode == "outer":
                     for loc in spec.xpath(".//*[text()='$0']"):
                         loc.text = ''
-                        loc.append(copy.deepcopy(node))
+                        copied_node = copy.deepcopy(node)
+                        # TODO: Remove 'inherit_branding' logic if possible;
+                        # currently needed to track node removal for branding
+                        # distribution. Avoid marking root nodes to prevent
+                        # sibling branding issues.
+                        if inherit_branding:
+                            copied_node.set('data-oe-no-branding', '1')
+                        loc.append(copied_node)
                     if node.getparent() is None:
                         spec_content = None
                         comment = None
@@ -216,11 +235,12 @@ def apply_inheritance_specs(source, specs_tree, inherit_branding=False, pre_loca
                     elif attribute in node.attrib:
                         del node.attrib[attribute]
             elif pos == 'inside':
-                add_text_inside(node, spec.text)
-                for child in spec:
-                    if child.get('position') == 'move':
-                        child = extract(child)
-                    node.append(child)
+                # add a sentinel element at the end, insert content of spec
+                # before the sentinel, then remove the sentinel element
+                sentinel = E.sentinel()
+                node.append(sentinel)
+                add_stripped_items_before(sentinel, spec, extract)
+                remove_element(sentinel)
             elif pos == 'after':
                 # add a sentinel element right after node, insert content of
                 # spec before the sentinel, then remove the sentinel element
@@ -229,18 +249,11 @@ def apply_inheritance_specs(source, specs_tree, inherit_branding=False, pre_loca
                 if node.tail is not None:  # for lxml >= 5.1
                     sentinel.tail = node.tail
                     node.tail = None
-                add_text_before(sentinel, spec.text)
-                for child in spec:
-                    if child.get('position') == 'move':
-                        child = extract(child)
-                    sentinel.addprevious(child)
+                add_stripped_items_before(sentinel, spec, extract)
                 remove_element(sentinel)
             elif pos == 'before':
-                add_text_before(node, spec.text)
-                for child in spec:
-                    if child.get('position') == 'move':
-                        child = extract(child)
-                    node.addprevious(child)
+                add_stripped_items_before(node, spec, extract)
+
             else:
                 raise ValueError(
                     _("Invalid position attribute: '%s'") %

@@ -25,7 +25,7 @@ class CreatorCase(common.TransactionCase):
 
     def export(self, value, fields=('value',), context=None):
         record = self.make(value, context=context)
-        record.invalidate_cache()
+        self.env.invalidate_all()
         return record._export_rows([f.split('/') for f in fields])
 
 class test_xids(CreatorCase):
@@ -40,7 +40,7 @@ class test_xids(CreatorCase):
             'model': self.model_name,
             'res_id': record.id,
         })
-        record.invalidate_cache()
+        self.env.invalidate_all()
         self.assertEqual(
             record._export_rows([['id'], ['value']]),
             [[u'x', True]]
@@ -257,7 +257,7 @@ class test_datetime(CreatorCase):
     def test_tz(self):
         """ Export converts the value in the user's TZ
 
-        .. note:: on the other hand, export uses user lang for name_get
+        .. note:: on the other hand, export uses user lang for display_name
         """
         self.assertEqual(
             self.export('2011-11-07 21:05:48', context={'tz': 'Pacific/Norfolk'}),
@@ -326,13 +326,12 @@ class test_m2o(CreatorCase):
             [['']])
 
     def test_basic(self):
-        """ Exported value is the name_get of the related object
+        """ Exported value is the display_name of the related object
         """
         record = self.env['export.integer'].create({'value': 42})
-        name = dict(record.name_get())[record.id]
         self.assertEqual(
             self.export(record.id),
-            [[name]])
+            [[record.display_name]])
 
     def test_path(self):
         """ Can recursively export fields of m2o via path
@@ -358,7 +357,7 @@ class test_m2o(CreatorCase):
           | self.make(m2o)
           | self.make(m2o)
         )
-        records.invalidate_cache()
+        self.env.invalidate_all()
         xp = [r[0] for r in records._export_rows([['value', 'id']])]
         self.assertEqual(len(xp), 4)
         self.assertRegex(
@@ -389,7 +388,7 @@ class test_o2m(CreatorCase):
     def test_single(self):
         self.assertEqual(
             self.export([Command.create({'value': 42})]),
-            # name_get result
+            # display_name result
             [[u'export.one2many.child:42']])
 
     def test_single_subfield(self):
@@ -600,7 +599,7 @@ class test_m2m(CreatorCase):
     def test_single(self):
         self.assertEqual(
             self.export([Command.create({'value': 42})]),
-            # name_get result
+            # display_name result
             [[u'export.many2many.other:42']])
 
     def test_single_subfield(self):
@@ -662,7 +661,7 @@ class test_m2m(CreatorCase):
             }).complete_name
             for sub in r.value
         ]
-        r.invalidate_cache()
+        self.env.invalidate_all()
 
         self.assertEqual(
             r._export_rows([['value', 'id']]),
@@ -728,7 +727,7 @@ class test_xid_perfs(common.TransactionCase):
         Model = self.env['export.integer']
         for i in range(10000):
             Model.create({'value': i})
-        Model.invalidate_cache()
+        self.env.invalidate_all()
         records = Model.search([])
 
         self.profile.runcall(records._export_rows, [['id'], ['value']])
@@ -738,7 +737,7 @@ class test_xid_perfs(common.TransactionCase):
         Model = self.env['export.many2one']
         for _ in range(10000):
             Model.create({'value': rid})
-        Model.invalidate_cache()
+        self.env.invalidate_all()
         records = Model.search([])
 
         self.profile.runcall(records._export_rows, [['id'], ['value','id']])
@@ -750,7 +749,7 @@ class test_xid_perfs(common.TransactionCase):
             Model.create({
                 'value': Integer.create({'value': i}).id
             })
-        Model.invalidate_cache()
+        self.env.invalidate_all()
         records = Model.search([])
 
         self.profile.runcall(records._export_rows, [['id'], ['value', 'id']])

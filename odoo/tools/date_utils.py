@@ -2,11 +2,14 @@
 import math
 import calendar
 from datetime import date, datetime, time
-import pytz
-from dateutil.relativedelta import relativedelta
+from typing import Tuple
 
-from . import ustr
+import babel
+import pytz
+from dateutil.relativedelta import relativedelta, weekdays
+
 from .func import lazy
+from odoo.loglevels import ustr
 
 
 def date_type(value):
@@ -55,39 +58,33 @@ def get_quarter(date):
 def get_fiscal_year(date, day=31, month=12):
     ''' Compute the fiscal year dates range on which the 'date' parameter belongs to.
     A fiscal year is the period used by governments for accounting purposes and vary between countries.
-
     By default, calling this method with only one parameter gives the calendar year because the ending date of the
     fiscal year is set to the YYYY-12-31.
-
     :param date:    A datetime.datetime or datetime.date object.
     :param day:     The day of month the fiscal year ends.
     :param month:   The month of year the fiscal year ends.
     :return: A tuple (date_from, date_to) having the same object type as the 'date' parameter.
     '''
-    max_day = calendar.monthrange(date.year, month)[1]
-    date_to = date_type(date)(date.year, month, min(day, max_day))
 
-    # Force at 29 February instead of 28 in case of leap year.
-    if date_to.month == 2 and date_to.day == 28 and max_day == 29:
-        date_to = date_type(date)(date.year, 2, 29)
+    def fix_day(year, month, day):
+        max_day = calendar.monthrange(year, month)[1]
+        if month == 2 and day in (28, max_day):
+            return max_day
+        return min(day, max_day)
+
+    day = fix_day(date.year, month, day)
+    date_to = date_type(date)(date.year, month, day)
 
     if date <= date_to:
         date_from = date_to - relativedelta(years=1)
-        max_day = calendar.monthrange(date_from.year, date_from.month)[1]
-
-        # Force at 29 February instead of 28 in case of leap year.
-        if date_from.month == 2 and date_from.day == 28 and max_day == 29:
-            date_from = date_type(date)(date_from.year, 2, 29)
-
+        day = fix_day(date_from.year, date_from.month, date_from.day)
+        date_from = date_type(date)(date_from.year, date_from.month, day)
         date_from += relativedelta(days=1)
     else:
         date_from = date_to + relativedelta(days=1)
-        max_day = calendar.monthrange(date_to.year + 1, date_to.month)[1]
-        date_to = date_type(date)(date.year + 1, month, min(day, max_day))
-
-        # Force at 29 February instead of 28 in case of leap year.
-        if date_to.month == 2 and date_to.day == 28 and max_day == 29:
-            date_to += relativedelta(days=1)
+        date_to = date_to + relativedelta(years=1)
+        day = fix_day(date_to.year, date_to.month, date_to.day)
+        date_to = date_type(date)(date_to.year, date_to.month, day)
     return date_from, date_to
 
 
@@ -226,25 +223,35 @@ def json_default(obj):
 def date_range(start, end, step=relativedelta(months=1)):
     """Date range generator with a step interval.
 
-    :param start datetime: beginning date of the range.
-    :param end datetime: ending date of the range.
-    :param step relativedelta: interval of the range.
+    :param date | datetime start: beginning date of the range.
+    :param date | datetime end: ending date of the range.
+    :param relativedelta step: interval of the range.
     :return: a range of datetime from start to end.
     :rtype: Iterator[datetime]
     """
+    if isinstance(start, datetime) and isinstance(end, datetime):
+        are_naive = start.tzinfo is None and end.tzinfo is None
+        are_utc = start.tzinfo == pytz.utc and end.tzinfo == pytz.utc
 
-    are_naive = start.tzinfo is None and end.tzinfo is None
-    are_utc = start.tzinfo == pytz.utc and end.tzinfo == pytz.utc
+        # Cases with miscellenous timezone are more complexe because of DST.
+        are_others = start.tzinfo and end.tzinfo and not are_utc
 
-    # Cases with miscellenous timezone are more complexe because of DST.
-    are_others = start.tzinfo and end.tzinfo and not are_utc
-
-    if are_others:
-        if start.tzinfo.zone != end.tzinfo.zone:
+        if are_others and start.tzinfo.zone != end.tzinfo.zone:
             raise ValueError("Timezones of start argument and end argument seem inconsistent")
 
-    if not are_naive and not are_utc and not are_others:
-        raise ValueError("Timezones of start argument and end argument mismatch")
+        if not are_naive and not are_utc and not are_others:
+            raise ValueError("Timezones of start argument and end argument mismatch")
+
+        dt = start.replace(tzinfo=None)
+        end_dt = end.replace(tzinfo=None)
+        post_process = start.tzinfo.localize if start.tzinfo else lambda dt: dt
+
+    elif isinstance(start, date) and isinstance(end, date):
+        dt, end_dt = start, end
+        post_process = lambda dt: dt
+
+    else:
+        raise ValueError("start/end should be both date or both datetime type")
 
     if start > end:
         raise ValueError("start > end, start date must be before end")
@@ -252,13 +259,46 @@ def date_range(start, end, step=relativedelta(months=1)):
     if start == start + step:
         raise ValueError("Looks like step is null")
 
-    if start.tzinfo:
-        localize = start.tzinfo.localize
-    else:
-        localize = lambda dt: dt
-
-    dt = start.replace(tzinfo=None)
-    end = end.replace(tzinfo=None)
-    while dt <= end:
-        yield localize(dt)
+    while dt <= end_dt:
+        yield post_process(dt)
         dt = dt + step
+
+
+def weeknumber(locale: babel.Locale, date: date) -> Tuple[int, int]:
+    """Computes the year and weeknumber of `date`. The week number is 1-indexed
+    (so the first week is week number 1).
+
+    For ISO locales (first day of week = monday, min week days = 4) the concept
+    is clear and the Python stdlib implements it directly.
+
+    For other locales, it's basically nonsensical as there is no actual
+    definition. For now we will implement non-split first-day-of-year, that is
+    the first week of the year is the one which contains the first day of the
+    year (taking first day of week in account), and the days of the previous
+    year which are part of that week are considered to be in the next year for
+    calendaring purposes.
+
+    That is December 27, 2015 is in the first week of 2016.
+
+    An alternative is to split the week in two, so the week from December 27,
+    2015 to January 2, 2016 would be *both* W53/2015 and W01/2016.
+    """
+    if locale.first_week_day == 0 and locale.min_week_days == 4:
+        # woohoo nothing to do
+        return date.isocalendar()[:2]
+
+    # first find the first day of the first week of the next year, if the
+    # reference date is after that then it must be in the first week of the next
+    # year, remove this if we decide to implement split weeks instead
+    fdny = date.replace(year=date.year + 1, month=1, day=1) \
+       - relativedelta(weekday=weekdays[locale.first_week_day](-1))
+    if date >= fdny:
+        return date.year + 1, 1
+
+    # otherwise get the number of periods of 7 days between the first day of the
+    # first week and the reference
+    fdow = date.replace(month=1, day=1) \
+       - relativedelta(weekday=weekdays[locale.first_week_day](-1))
+    doy = (date - fdow).days
+
+    return date.year, (doy // 7 + 1)

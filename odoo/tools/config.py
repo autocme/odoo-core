@@ -10,7 +10,7 @@ import sys
 import tempfile
 import warnings
 import odoo
-from os.path import expandvars, expanduser, abspath, realpath
+from os.path import expandvars, expanduser, abspath, realpath, normcase
 from .. import release, conf, loglevels
 from . import appdirs
 
@@ -78,12 +78,16 @@ class configmanager(object):
             'publisher_warranty_url': 'http://services.openerp.com/publisher-warranty/',
             'reportgz': False,
             'root_path': None,
+            'websocket_keep_alive_timeout': 3600,
+            'websocket_rate_limit_burst': 10,
+            'websocket_rate_limit_delay': 0.2,
         }
 
         # Not exposed in the configuration file.
         self.blacklist_for_save = set([
             'publisher_warranty_url', 'load_language', 'root_path',
-            'init', 'save', 'config', 'update', 'stop_after_init', 'dev_mode', 'shell_interface'
+            'init', 'save', 'config', 'update', 'stop_after_init', 'dev_mode', 'shell_interface',
+            'longpolling_port',
         ])
 
         # dictionary mapping option destination (keys in self.options) to MyOptions.
@@ -111,6 +115,7 @@ class configmanager(object):
         group.add_option("--without-demo", dest="without_demo",
                           help="disable loading demo data for modules to be installed (comma-separated, use \"all\" for all modules). Requires -d and -i. Default is %default",
                           my_default=False)
+        group.add_option("--skip-auto-install", dest="skip_auto_install", action="store_true", my_default=False, help="skip the automatic installation of modules marked as auto_install")
         group.add_option("-P", "--import-partial", dest="import_partial", my_default='',
                         help="Use this for big data importation, if it crashes you will be able to continue at the current state. Provide a filename to store intermediate importation states.")
         group.add_option("--pidfile", dest="pidfile", help="file where the server pid will be stored")
@@ -120,6 +125,9 @@ class configmanager(object):
         group.add_option("--upgrade-path", dest="upgrade_path",
                          help="specify an additional upgrade path.",
                          action="callback", callback=self._check_upgrade_path, nargs=1, type="string")
+        group.add_option("--pre-upgrade-scripts", dest="pre_upgrade_scripts", my_default="",
+                         help="Run specific upgrade scripts before loading any module when -u is provided.",
+                         action="callback", callback=self._check_scripts, nargs=1, type="string")
         group.add_option("--load", dest="server_wide_modules", help="Comma-separated list of server-wide modules.", my_default='base,web')
 
         group.add_option("-D", "--data-dir", dest="data_dir", my_default=_get_default_datadir(),
@@ -133,13 +141,19 @@ class configmanager(object):
                               "Keep empty to listen on all interfaces (0.0.0.0)")
         group.add_option("-p", "--http-port", dest="http_port", my_default=8069,
                          help="Listen port for the main HTTP service", type="int", metavar="PORT")
-        group.add_option("--longpolling-port", dest="longpolling_port", my_default=8072,
-                         help="Listen port for the longpolling HTTP service", type="int", metavar="PORT")
+        group.add_option("--longpolling-port", dest="longpolling_port", my_default=0,
+                         help="Deprecated alias to the gevent-port option", type="int", metavar="PORT")
+        group.add_option("--gevent-port", dest="gevent_port", my_default=8072,
+                         help="Listen port for the gevent worker", type="int", metavar="PORT")
         group.add_option("--no-http", dest="http_enable", action="store_false", my_default=True,
                          help="Disable the HTTP and Longpolling services entirely")
         group.add_option("--proxy-mode", dest="proxy_mode", action="store_true", my_default=False,
                          help="Activate reverse proxy WSGI wrappers (headers rewriting) "
                               "Only enable this when running behind a trusted web proxy!")
+        group.add_option("--x-sendfile", dest="x_sendfile", action="store_true", my_default=False,
+                         help="Activate X-Sendfile (apache) and X-Accel-Redirect (nginx) "
+                              "HTTP response header to delegate the delivery of large "
+                              "files (assets/attachments) to the web server.")
         # HTTP: hidden backwards-compatibility for "*xmlrpc*" options
         hidden = optparse.SUPPRESS_HELP
         group.add_option("--xmlrpc-interface", dest="http_interface", help=hidden)
@@ -164,7 +178,7 @@ class configmanager(object):
                          help="Enable unit tests.")
         group.add_option("--test-tags", dest="test_tags",
                          help="Comma-separated list of specs to filter which tests to execute. Enable unit tests if set. "
-                         "A filter spec has the format: [-][tag][/module][:class][.method] "
+                         "A filter spec has the format: [-][tag][/module][:class][.method][[params]] "
                          "The '-' specifies if we want to include or exclude tests matching this spec. "
                          "The tag will match tags added on a class with a @tagged decorator "
                          "(all Test classes have 'standard' and 'at_install' tags "
@@ -174,6 +188,9 @@ class configmanager(object):
                          "If tag is omitted on exclude mode, its value is '*'. "
                          "The module, class, and method will respectively match the module name, test class name and test method name. "
                          "Example: --test-tags :TestClass.test_func,/test_module,external "
+                         "It is also possible to provide parameters to a test method that supports them"
+                         "Example: --test-tags /web.test_js[mail]"
+                         "If negated, a test-tag with parameter will negate the parameter when passing it to the test"
 
                          "Filtering and executing the tests happens twice: right "
                          "after each module installation/update and at the end "
@@ -195,8 +212,6 @@ class configmanager(object):
         group.add_option("--logfile", dest="logfile", help="file where the server log will be stored")
         group.add_option("--syslog", action="store_true", dest="syslog", my_default=False, help="Send the log to the syslog server")
         group.add_option('--log-handler', action="append", default=[], my_default=DEFAULT_LOG_HANDLER, metavar="PREFIX:LEVEL", help='setup a handler at LEVEL for a given PREFIX. An empty PREFIX indicates the root logger. This option can be repeated. Example: "odoo.orm:DEBUG" or "werkzeug:CRITICAL" (default: ":INFO")')
-        group.add_option('--log-request', action="append_const", dest="log_handler", const="odoo.http.rpc.request:DEBUG", help='shortcut for --log-handler=odoo.http.rpc.request:DEBUG')
-        group.add_option('--log-response', action="append_const", dest="log_handler", const="odoo.http.rpc.response:DEBUG", help='shortcut for --log-handler=odoo.http.rpc.response:DEBUG')
         group.add_option('--log-web', action="append_const", dest="log_handler", const="odoo.http:DEBUG", help='shortcut for --log-handler=odoo.http:DEBUG')
         group.add_option('--log-sql', action="append_const", dest="log_handler", const="odoo.sql_db:DEBUG", help='shortcut for --log-handler=odoo.sql_db:DEBUG')
         group.add_option('--log-db', dest='log_db', help="Logging database", my_default=False)
@@ -252,6 +267,8 @@ class configmanager(object):
                          help="specify the database ssl connection mode (see PostgreSQL documentation)")
         group.add_option("--db_maxconn", dest="db_maxconn", type='int', my_default=64,
                          help="specify the maximum number of physical connections to PostgreSQL")
+        group.add_option("--db_maxconn_gevent", dest="db_maxconn_gevent", type='int', my_default=False,
+                         help="specify the maximum number of physical connections to PostgreSQL specifically for the gevent worker")
         group.add_option("--db-template", dest="db_template", my_default="template0",
                          help="specify a custom database template to create a new database")
         parser.add_option_group(group)
@@ -286,13 +303,13 @@ class configmanager(object):
         group = optparse.OptionGroup(parser, "Advanced options")
         group.add_option('--dev', dest='dev_mode', type="string",
                          help="Enable developer mode. Param: List of options separated by comma. "
-                              "Options : all, [pudb|wdb|ipdb|pdb], reload, qweb, werkzeug, xml")
+                              "Options : all, reload, qweb, xml")
         group.add_option('--shell-interface', dest='shell_interface', type="string",
                          help="Specify a preferred REPL to use in shell mode. Supported REPLs are: "
                               "[ipython|ptpython|bpython|python]")
         group.add_option("--stop-after-init", action="store_true", dest="stop_after_init", my_default=False,
                           help="stop the server after its initialization")
-        group.add_option("--osv-memory-count-limit", dest="osv_memory_count_limit", my_default=False,
+        group.add_option("--osv-memory-count-limit", dest="osv_memory_count_limit", my_default=0,
                          help="Force a limit on the maximum number of records kept in the virtual "
                               "osv_memory tables. By default there is no limit.",
                          type="int")
@@ -300,16 +317,19 @@ class configmanager(object):
                          help="Time limit (decimal value in hours) records created with a "
                               "TransientModel (mostly wizard) are kept in the database. Default to 1 hour.",
                          type="float")
-        group.add_option("--osv-memory-age-limit", dest="osv_memory_age_limit", my_default=False,
-                         help="Deprecated alias to the transient-age-limit option",
-                         type="float")
         group.add_option("--max-cron-threads", dest="max_cron_threads", my_default=2,
                          help="Maximum number of threads processing concurrently cron jobs (default 2).",
                          type="int")
+        group.add_option("--limit-time-worker-cron", dest="limit_time_worker_cron", my_default=0,
+                         help="Maximum time a cron thread/worker stays alive before it is restarted. "
+                              "Set to 0 to disable. (default: 0)",
+                         type="int")
         group.add_option("--unaccent", dest="unaccent", my_default=False, action="store_true",
                          help="Try to enable the unaccent extension when creating new databases.")
-        group.add_option("--geoip-db", dest="geoip_database", my_default='/usr/share/GeoIP/GeoLite2-City.mmdb',
-                         help="Absolute path to the GeoIP database file.")
+        group.add_option("--geoip-city-db", "--geoip-db", dest="geoip_city_db", my_default='/usr/share/GeoIP/GeoLite2-City.mmdb',
+                         help="Absolute path to the GeoIP City database file.")
+        group.add_option("--geoip-country-db", dest="geoip_country_db", my_default='/usr/share/GeoIP/GeoLite2-Country.mmdb',
+                         help="Absolute path to the GeoIP Country database file.")
         parser.add_option_group(group)
 
         if os.name == 'posix':
@@ -336,8 +356,8 @@ class configmanager(object):
                              help="Maximum allowed Real time per cron job. (default: --limit-time-real). "
                                   "Set to 0 for no limit. ",
                              type="int")
-            group.add_option("--limit-request", dest="limit_request", my_default=8192,
-                             help="Maximum number of request to be processed per worker (default 8192).",
+            group.add_option("--limit-request", dest="limit_request", my_default=2**16,
+                             help="Maximum number of request to be processed per worker (default 65536).",
                              type="int")
             parser.add_option_group(group)
 
@@ -401,10 +421,6 @@ class configmanager(object):
             "The config file '%s' selected with -c/--config doesn't exist or is not readable, "\
             "use -s/--save if you want to generate it"% opt.config)
 
-        die(bool(opt.osv_memory_age_limit) and bool(opt.transient_memory_age_limit),
-            "the osv-memory-count-limit option cannot be used with the "
-            "transient-age-limit option, please only use the latter.")
-
         # place/search the config file on Win32 near the server installation
         # (../etc from the server)
         # if the server is run by an unprivileged user, he has to specify location of a config file where he has the rights to write,
@@ -441,15 +457,16 @@ class configmanager(object):
             self.options['server_wide_modules'] = 'base,web'
 
         # if defined do not take the configfile value even if the defined value is None
-        keys = ['http_interface', 'http_port', 'longpolling_port', 'http_enable',
+        keys = ['gevent_port', 'http_interface', 'http_port', 'longpolling_port', 'http_enable', 'x_sendfile',
                 'db_name', 'db_user', 'db_password', 'db_host', 'db_sslmode',
                 'db_port', 'db_template', 'logfile', 'pidfile', 'smtp_port',
                 'email_from', 'smtp_server', 'smtp_user', 'smtp_password', 'from_filter',
                 'smtp_ssl_certificate_filename', 'smtp_ssl_private_key_filename',
-                'db_maxconn', 'import_partial', 'addons_path', 'upgrade_path',
-                'syslog', 'without_demo', 'screencasts', 'screenshots',
+                'db_maxconn', 'db_maxconn_gevent', 'import_partial', 'addons_path', 'upgrade_path', 'pre_upgrade_scripts',
+                'syslog', 'without_demo', 'skip_auto_install', 'screencasts', 'screenshots',
                 'dbfilter', 'log_level', 'log_db',
-                'log_db_level', 'geoip_database', 'dev_mode', 'shell_interface'
+                'log_db_level', 'geoip_city_db', 'geoip_country_db', 'dev_mode',
+                'shell_interface', 'limit_time_worker_cron',
         ]
 
         for arg in keys:
@@ -469,10 +486,10 @@ class configmanager(object):
         keys = [
             'language', 'translate_out', 'translate_in', 'overwrite_existing_translations',
             'dev_mode', 'shell_interface', 'smtp_ssl', 'load_language',
-            'stop_after_init', 'without_demo', 'http_enable', 'syslog',
+            'stop_after_init', 'without_demo', 'skip_auto_install', 'http_enable', 'syslog',
             'list_db', 'proxy_mode',
             'test_file', 'test_tags',
-            'osv_memory_count_limit', 'osv_memory_age_limit', 'transient_age_limit', 'max_cron_threads', 'unaccent',
+            'osv_memory_count_limit', 'transient_age_limit', 'max_cron_threads', 'unaccent',
             'data_dir',
             'server_wide_modules',
         ]
@@ -496,6 +513,8 @@ class configmanager(object):
             elif isinstance(self.options[arg], str) and self.casts[arg].type in optparse.Option.TYPE_CHECKER:
                 self.options[arg] = optparse.Option.TYPE_CHECKER[self.casts[arg].type](self.casts[arg], arg, self.options[arg])
 
+        ismultidb = ',' in (self.options.get('db_name') or '')
+        die(ismultidb and (opt.init or opt.update), "Cannot use -i/--init or -u/--update with multiple databases in the -d/--database/db_name")
         self.options['root_path'] = self._normalize(os.path.join(os.path.dirname(__file__), '..'))
         if not self.options['addons_path'] or self.options['addons_path']=='None':
             default_addons = []
@@ -509,12 +528,21 @@ class configmanager(object):
         else:
             self.options['addons_path'] = ",".join(
                 self._normalize(x)
-                for x in self.options['addons_path'].split(','))
+                for x in self.options['addons_path'].split(',')
+                if x.strip())
 
         self.options["upgrade_path"] = (
             ",".join(self._normalize(x)
-                for x in self.options['upgrade_path'].split(','))
+                for x in self.options['upgrade_path'].split(',')
+                if x.strip())
             if self.options['upgrade_path']
+            else ""
+        )
+        self.options["pre_upgrade_scripts"] = (
+            ",".join(self._normalize(x)
+                for x in self.options['pre_upgrade_scripts'].split(',')
+                if x.strip())
+            if self.options['pre_upgrade_scripts']
             else ""
         )
 
@@ -525,8 +553,8 @@ class configmanager(object):
         self.options['translate_modules'] = opt.translate_modules and [m.strip() for m in opt.translate_modules.split(',')] or ['all']
         self.options['translate_modules'].sort()
 
-        dev_split = opt.dev_mode and  [s.strip() for s in opt.dev_mode.split(',')] or []
-        self.options['dev_mode'] = 'all' in dev_split and dev_split + ['pdb', 'reload', 'qweb', 'werkzeug', 'xml'] or dev_split
+        dev_split = [s.strip() for s in opt.dev_mode.split(',')] if opt.dev_mode else []
+        self.options['dev_mode'] = dev_split + (['reload', 'qweb', 'xml'] if 'all' in dev_split else [])
 
         if opt.pg_path:
             self.options['pg_path'] = opt.pg_path
@@ -537,7 +565,7 @@ class configmanager(object):
             self.save()
 
         # normalize path options
-        for key in ['data_dir', 'logfile', 'pidfile', 'test_file', 'screencasts', 'screenshots', 'pg_path', 'translate_out', 'translate_in', 'geoip_database']:
+        for key in ['data_dir', 'logfile', 'pidfile', 'test_file', 'screencasts', 'screenshots', 'pg_path', 'translate_out', 'translate_in', 'geoip_city_db', 'geoip_country_db']:
             self.options[key] = self._normalize(self.options[key])
 
         conf.addons_paths = self.options['addons_path'].split(',')
@@ -548,12 +576,47 @@ class configmanager(object):
         return opt
 
     def _warn_deprecated_options(self):
-        if self.options['osv_memory_age_limit']:
+        if self.options.get('longpolling_port', 0):
             warnings.warn(
-                "The osv-memory-age-limit is a deprecated alias to "
-                "the transient-age-limit option, please use the latter.",
+                "The longpolling-port is a deprecated alias to "
+                "the gevent-port option, please use the latter.",
                 DeprecationWarning)
-            self.options['transient_age_limit'] = self.options.pop('osv_memory_age_limit')
+            self.options['gevent_port'] = self.options.pop('longpolling_port')
+
+        for old_option_name, new_option_name in [
+            ('geoip_database', 'geoip_city_db'),
+            ('osv_memory_age_limit', 'transient_age_limit')
+        ]:
+            deprecated_value = self.options.pop(old_option_name, None)
+            if deprecated_value:
+                default_value = self.casts[new_option_name].my_default
+                current_value = self.options[new_option_name]
+
+                if deprecated_value in (current_value, default_value):
+                    # Surely this is from a --save that was run in a
+                    # prior version. There is no point in emitting a
+                    # warning because: (1) it holds the same value as
+                    # the correct option, and (2) it is going to be
+                    # automatically removed on the next --save anyway.
+                    pass
+                elif current_value == default_value:
+                    # deprecated_value != current_value == default_value
+                    # assume the new option was not set
+                    self.options[new_option_name] = deprecated_value
+                    warnings.warn(
+                        f"The {old_option_name!r} option found in the "
+                        "configuration file is a deprecated alias to "
+                        f"{new_option_name!r}, please use the latter.",
+                        DeprecationWarning)
+                else:
+                    # deprecated_value != current_value != default_value
+                    self.parser.error(
+                        f"The two options {old_option_name!r} "
+                        "(found in the configuration file but "
+                        f"deprecated) and {new_option_name!r} are set "
+                        "to different values. Please remove the first "
+                        "one and make sure the second is correct."
+                    )
 
     def _is_addons_path(self, path):
         from odoo.modules.module import MANIFEST_NAMES
@@ -578,6 +641,18 @@ class configmanager(object):
             ad_paths.append(res)
 
         setattr(parser.values, option.dest, ",".join(ad_paths))
+
+    def _check_scripts(self, option, opt, value, parser):
+        pre_upgrade_scripts = []
+        for path in value.split(','):
+            path = path.strip()
+            res = self._normalize(path)
+            if not os.path.isfile(res):
+                raise optparse.OptionValueError("option %s: no such file: %r" % (opt, path))
+            if res not in pre_upgrade_scripts:
+                pre_upgrade_scripts.append(res)
+        setattr(parser.values, option.dest, ",".join(pre_upgrade_scripts))
+
 
     def _check_upgrade_path(self, option, opt, value, parser):
         upgrade_path = []
@@ -634,12 +709,18 @@ class configmanager(object):
         except ConfigParser.NoSectionError:
             pass
 
-    def save(self):
+    def save(self, keys=None):
         p = ConfigParser.RawConfigParser()
         loglevelnames = dict(zip(self._LOGLEVELS.values(), self._LOGLEVELS))
-        p.add_section('options')
+        rc_exists = os.path.exists(self.rcfile)
+        if rc_exists and keys:
+            p.read([self.rcfile])
+        if not p.has_section('options'):
+            p.add_section('options')
         for opt in sorted(self.options):
-            if opt in ('version', 'language', 'translate_out', 'translate_in', 'overwrite_existing_translations', 'init', 'update'):
+            if keys is not None and opt not in keys:
+                continue
+            if opt in ('version', 'language', 'translate_out', 'translate_in', 'overwrite_existing_translations', 'init', 'update', 'demo'):
                 continue
             if opt in self.blacklist_for_save:
                 continue
@@ -657,7 +738,6 @@ class configmanager(object):
 
         # try to create the directories and write the file
         try:
-            rc_exists = os.path.exists(self.rcfile)
             if not rc_exists and not os.path.exists(os.path.dirname(self.rcfile)):
                 os.makedirs(os.path.dirname(self.rcfile))
             try:
@@ -738,7 +818,7 @@ class configmanager(object):
     def _normalize(self, path):
         if not path:
             return ''
-        return realpath(abspath(expanduser(expandvars(path.strip()))))
+        return normcase(realpath(abspath(expanduser(expandvars(path.strip())))))
 
 
 config = configmanager()

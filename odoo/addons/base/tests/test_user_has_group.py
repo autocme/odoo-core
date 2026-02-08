@@ -164,7 +164,7 @@ class TestHasGroup(TransactionCase):
         """Contrarily to test_two_user_types, we simply add an implied_id to a group.
            This will trigger the addition of the relevant users to the relevant groups;
            if, say, this was done in SQL and thus bypassing the ORM, it would bypass the constraints
-           and thus give us a case uncovered by the aforementioned test.
+           and field recomputations, and thus give us a case uncovered by the aforementioned test.
         """
         grp_test = self.env["res.groups"].create(
             {"name": "test", "implied_ids": [Command.set([self.grp_internal.id])]})
@@ -175,8 +175,39 @@ class TestHasGroup(TransactionCase):
             'groups_id': [Command.set([grp_test.id])]
         })
 
-        with self.assertRaises(ValidationError):
+        with self.assertRaisesRegex(ValidationError, "The user cannot have more than one user types"), self.env.cr.savepoint():
             grp_test.write({'implied_ids': [Command.link(self.grp_portal.id)]})
+
+        self.env["ir.model.fields"].create(
+            {
+                "name": "x_group_names",
+                "model_id": self.env.ref("base.model_res_users").id,
+                "state": "manual",
+                "field_description": "A computed field that depends on groups_id",
+                "compute": "for r in self: r['x_group_names'] = ', '.join(r.groups_id.mapped('name'))",
+                "depends": "groups_id",
+                "store": True,
+                "ttype": "char",
+            }
+        )
+        self.env["ir.model.fields"].create(
+            {
+                "name": "x_user_names",
+                "model_id": self.env.ref("base.model_res_groups").id,
+                "state": "manual",
+                "field_description": "A computed field that depends on users",
+                "compute": "for r in self: r['x_user_names'] = ', '.join(r.users.mapped('name'))",
+                "depends": "users",
+                "store": True,
+                "ttype": "char",
+            }
+        )
+
+        grp_additional = self.env["res.groups"].create({"name": "additional"})
+        grp_test.write({'implied_ids': [Command.link(grp_additional.id)]})
+
+        self.assertIn(grp_additional.name, test_user.x_group_names)
+        self.assertIn(test_user.name, grp_additional.x_user_names)
 
     def test_demote_user(self):
         """When a user is demoted to the status of portal/public,
@@ -252,17 +283,17 @@ class TestHasGroup(TransactionCase):
             user_b.write({"groups_id": [Command.link(group_C.id)]})
 
     def test_has_group_cleared_cache_on_write(self):
-        self.registry._clear_cache()
-        self.assertFalse(self.registry._Registry__cache, "Ensure ormcache is empty")
+        self.env.registry.clear_cache()
+        self.assertFalse(self.registry._Registry__caches['default'], "Ensure ormcache is empty")
 
         def populate_cache():
             self.test_user.has_group('test_user_has_group.group0')
-            self.assertTrue(self.registry._Registry__cache, "user.has_group cache must be populated")
+            self.assertTrue(self.registry._Registry__caches['default'], "user.has_group cache must be populated")
 
         populate_cache()
 
         self.env.ref(self.group0).write({"share": True})
-        self.assertFalse(self.registry._Registry__cache, "Writing on group must invalidate user.has_group cache")
+        self.assertFalse(self.registry._Registry__caches['default'], "Writing on group must invalidate user.has_group cache")
 
         populate_cache()
         # call_cache_clearing_methods is called in res.groups.write to invalidate
@@ -272,6 +303,6 @@ class TestHasGroup(TransactionCase):
         # the ormcache of method `user.has_group()`
         self.env['ir.model.access'].call_cache_clearing_methods()
         self.assertFalse(
-            self.registry._Registry__cache,
+            self.registry._Registry__caches['default'],
             "call_cache_clearing_methods() must invalidate user.has_group cache"
         )
