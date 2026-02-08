@@ -12,7 +12,7 @@
                         <field name="menu_id"/>
                     </group>
                     <footer>
-                        <button name="menu_create" string="Create _Menu" type="object" class="btn-primary" data-hotkey="q"/>
+                        <button name="menu_create" string="Create Menu" type="object" class="btn-primary" data-hotkey="q"/>
                         <button string="Cancel" class="btn-secondary" special="cancel" data-hotkey="z" />
                     </footer>
                 </form>
@@ -248,6 +248,7 @@
             <field name="model">ir.model.fields</field>
             <field name="arch" type="xml">
                 <form string="Fields" duplicate="false">
+                    <field name="state" invisible="1"/>
                     <sheet>
                         <group>
                             <group>
@@ -418,7 +419,7 @@
                 <form string="Fields" duplicate="false">
                     <sheet>
                         <group>
-                            <field name="field_id"/>
+                            <field name="field_id" options="{'no_create': True}"/>
                             <field name="value" groups="base.group_no_one"/>
                             <field name="name"/>
                             <field name="sequence" groups="base.group_no_one"/>

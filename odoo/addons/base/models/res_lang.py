@@ -81,6 +81,23 @@ class Lang(models.Model):
                                             'Please refer to the list of allowed directives, '
                                             'displayed when you edit a language.'))
 
+    @api.onchange('time_format', 'date_format')
+    def _onchange_format(self):
+        warning = {
+            'warning': {
+                'title': _("Using 24-hour clock format with AM/PM can cause issues."),
+                'message': _("Changing to 12-hour clock format instead."),
+                'type': 'notification'
+            }
+        }
+        for lang in self:
+            if lang.date_format and "%H" in lang.date_format and "%p" in lang.date_format:
+                lang.date_format = lang.date_format.replace("%H", "%I")
+                return warning
+            if lang.time_format and "%H" in lang.time_format and "%p" in lang.time_format:
+                lang.time_format = lang.time_format.replace("%H", "%I")
+                return warning
+
     @api.constrains('grouping')
     def _check_grouping(self):
         warning = _('The Separator Format should be like [,n] where 0 < n :starting from Unit digit. '
@@ -201,6 +218,10 @@ class Lang(models.Model):
     def _lang_get_id(self, code):
         return self.with_context(active_test=True).search([('code', '=', code)]).id
 
+    @tools.ormcache('code')
+    def _lang_get_direction(self, code):
+        return self.with_context(active_test=True).search([('code', '=', code)]).direction
+
     @tools.ormcache('url_code')
     def _lang_get_code(self, url_code):
         return self.with_context(active_test=True).search([('url_code', '=', url_code)]).code or url_code
@@ -277,17 +298,17 @@ class Lang(models.Model):
         if 'code' in vals and any(code != vals['code'] for code in lang_codes):
             raise UserError(_("Language code cannot be modified."))
         if vals.get('active') == False:
-            if self.env['res.users'].with_context(active_test=True).search_count([('lang', 'in', lang_codes)]):
+            if self.env['res.users'].with_context(active_test=True).search_count([('lang', 'in', lang_codes)], limit=1):
                 raise UserError(_("Cannot deactivate a language that is currently used by users."))
-            if self.env['res.partner'].with_context(active_test=True).search_count([('lang', 'in', lang_codes)]):
+            if self.env['res.partner'].with_context(active_test=True).search_count([('lang', 'in', lang_codes)], limit=1):
                 raise UserError(_("Cannot deactivate a language that is currently used by contacts."))
-            if self.env['res.users'].with_context(active_test=False).search_count([('lang', 'in', lang_codes)]):
+            if self.env['res.users'].with_context(active_test=False).search_count([('lang', 'in', lang_codes)], limit=1):
                 raise UserError(_("You cannot archive the language in which Odoo was setup as it is used by automated processes."))
             # delete linked ir.default specifying default partner's language
             self.env['ir.default'].discard_values('res.partner', 'lang', lang_codes)
 
         res = super(Lang, self).write(vals)
-        self.flush()
+        self.env.flush_all()
         self.clear_caches()
         return res
 
@@ -303,10 +324,19 @@ class Lang(models.Model):
                 raise UserError(_("You cannot delete the language which is Active!\nPlease de-activate the language first."))
 
     def unlink(self):
-        for language in self:
-            self.env['ir.translation'].search([('lang', '=', language.code)]).unlink()
         self.clear_caches()
         return super(Lang, self).unlink()
+
+    def copy_data(self, default=None):
+        default = dict(default or {})
+
+        if "name" not in default:
+            default["name"] = _("%s (copy)", self.name)
+        if "code" not in default:
+            default["code"] = _("%s (copy)", self.code)
+        if "url_code" not in default:
+            default["url_code"] = _("%s (copy)", self.url_code)
+        return super().copy_data(default=default)
 
     def format(self, percent, value, grouping=False, monetary=False):
         """ Format() will return the language-specific output for float values"""
@@ -332,16 +362,23 @@ class Lang(models.Model):
 
         return formatted
 
-    def copy_data(self, default=None):
-        default = dict(default or {})
+    def action_activate_langs(self):
+        """ Activate the selected languages """
+        for lang in self.filtered(lambda l: not l.active):
+            lang.toggle_active()
+        message = _("The languages that you selected have been successfully installed. Users can choose their favorite language in their preferences.")
+        return {
+            'type': 'ir.actions.client',
+            'tag': 'display_notification',
+            'target': 'new',
+            'params': {
+                'message': message,
+                'type': 'success',
+                'sticky': False,
+                'next': {'type': 'ir.actions.act_window_close'},
+            }
+        }
 
-        if "name" not in default:
-            default["name"] = _("%s (copy)", self.name)
-        if "code" not in default:
-            default["code"] = _("%s (copy)", self.code)
-        if "url_code" not in default:
-            default["url_code"] = _("%s (copy)", self.url_code)
-        return super().copy_data(default=default)
 
 def split(l, counts):
     """

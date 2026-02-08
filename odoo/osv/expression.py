@@ -114,20 +114,17 @@ start the server specifying the ``--unaccent`` flag.
 
 """
 import collections.abc
-import warnings
-
 import logging
 import reprlib
 import traceback
-from functools import partial
-
+import warnings
 from datetime import date, datetime, time
+
+from psycopg2.sql import Composable, SQL
+
 import odoo.modules
-from odoo.osv.query import Query, _generate_table_alias
-from odoo.tools import pycompat
-from odoo.tools.misc import get_lang
-from ..models import MAGIC_COLUMNS, BaseModel
-import odoo.tools as tools
+from ..models import BaseModel
+from odoo.tools import pycompat, Query, _generate_table_alias, sql
 
 
 # Domain operators.
@@ -176,8 +173,19 @@ TERM_OPERATORS_NEGATION = {
 TRUE_LEAF = (1, '=', 1)
 FALSE_LEAF = (0, '=', 1)
 
-TRUE_DOMAIN = [TRUE_LEAF]
-FALSE_DOMAIN = [FALSE_LEAF]
+
+class _ProtectedDomain(tuple):
+    __slots__ = ()
+    __hash__ = None
+
+    def __eq__(self, other): return list(self).__eq__(other)
+    def __add__(self, other): return tuple(self) + tuple(other) if isinstance(other, (list, tuple)) else NotImplemented
+    def __radd__(self, other): return tuple(other) + tuple(self) if isinstance(other, (list, tuple)) else NotImplemented
+    def copy(self): return list(self)
+
+
+TRUE_DOMAIN = _ProtectedDomain([TRUE_LEAF])
+FALSE_DOMAIN = _ProtectedDomain([FALSE_LEAF])
 
 _logger = logging.getLogger(__name__)
 
@@ -241,6 +249,7 @@ def combine(operator, unit, zero, domains):
 
        It is guaranteed to return a normalized domain.
 
+       :param operator:
        :param unit: the identity element of the domains "set" with regard to the operation
                     performed by ``operator``, i.e the domain component ``i`` which, when
                     combined with any domain ``x`` via ``operator``, yields ``x``.
@@ -368,12 +377,13 @@ def is_operator(element):
 
 def is_leaf(element, internal=False):
     """ Test whether an object is a valid domain term:
+
         - is a list or tuple
         - with 3 elements
         - second element if a valid op
 
         :param tuple element: a leaf in form (left, operator, right)
-        :param boolean internal: allow or not the 'inselect' internal operator
+        :param bool internal: allow or not the 'inselect' internal operator
             in the term. This should be always left to False.
 
         Note: OLD TODO change the share wizard to use this function.
@@ -401,9 +411,14 @@ def check_leaf(element, internal=False):
 # SQL utils
 # --------------------------------------------------
 
+def _unaccent_wrapper(x):
+    if isinstance(x, Composable):
+        return SQL('unaccent({})').format(x)
+    return 'unaccent({})'.format(x)
+
 def get_unaccent_wrapper(cr):
     if odoo.registry(cr.dbname).has_unaccent:
-        return lambda x: "unaccent(%s)" % (x,)
+        return _unaccent_wrapper
     return lambda x: x
 
 
@@ -428,7 +443,8 @@ class expression(object):
             :attr result: the result of the parsing, as a pair (query, params)
             :attr query: Query object holding the final result
         """
-        self._unaccent = get_unaccent_wrapper(model._cr)
+        self._unaccent_wrapper = get_unaccent_wrapper(model._cr)
+        self._has_trigram = model.pool.has_trigram
         self.root_model = model
         self.root_alias = alias or model._table
 
@@ -440,6 +456,11 @@ class expression(object):
 
         # parse the domain expression
         self.parse()
+
+    def _unaccent(self, field):
+        if getattr(field, 'unaccent', False):
+            return self._unaccent_wrapper
+        return lambda x: x
 
     # ----------------------------------------
     # Leafs management
@@ -457,50 +478,58 @@ class expression(object):
     def parse(self):
         """ Transform the leaves of the expression
 
-            The principle is to pop elements from a leaf stack one at a time.
-            Each leaf is processed. The processing is a if/elif list of various
-            cases that appear in the leafs (many2one, function fields, ...).
-            Three things can happen as a processing result:
-            - the leaf is a logic operator, and updates the result stack
-              accordingly;
-            - the leaf has been modified and/or new leafs have to be introduced
-              in the expression; they are pushed into the leaf stack, to be
-              processed right after;
-            - the leaf is converted to SQL and added to the result stack
+        The principle is to pop elements from a leaf stack one at a time.
+        Each leaf is processed. The processing is a if/elif list of various
+        cases that appear in the leafs (many2one, function fields, ...).
 
-            Here is a suggested execution:
+        Three things can happen as a processing result:
 
-                step                stack               result_stack
+        - the leaf is a logic operator, and updates the result stack
+          accordingly;
+        - the leaf has been modified and/or new leafs have to be introduced
+          in the expression; they are pushed into the leaf stack, to be
+          processed right after;
+        - the leaf is converted to SQL and added to the result stack
 
-                                    ['&', A, B]         []
-                substitute B        ['&', A, B1]        []
-                convert B1 in SQL   ['&', A]            ["B1"]
-                substitute A        ['&', '|', A1, A2]  ["B1"]
-                convert A2 in SQL   ['&', '|', A1]      ["B1", "A2"]
-                convert A1 in SQL   ['&', '|']          ["B1", "A2", "A1"]
-                apply operator OR   ['&']               ["B1", "A1 or A2"]
-                apply operator AND  []                  ["(A1 or A2) and B1"]
+        Example:
 
-            Some internal var explanation:
-                :var list path: left operand seen as a sequence of field names
-                    ("foo.bar" -> ["foo", "bar"])
-                :var obj model: model object, model containing the field
-                    (the name provided in the left operand)
-                :var obj field: the field corresponding to `path[0]`
-                :var obj column: the column corresponding to `path[0]`
-                :var obj comodel: relational model of field (field.comodel)
-                    (res_partner.bank_ids -> res.partner.bank)
+        =================== =================== =====================
+        step                stack               result_stack
+        =================== =================== =====================
+                            ['&', A, B]         []
+        substitute B        ['&', A, B1]        []
+        convert B1 in SQL   ['&', A]            ["B1"]
+        substitute A        ['&', '|', A1, A2]  ["B1"]
+        convert A2 in SQL   ['&', '|', A1]      ["B1", "A2"]
+        convert A1 in SQL   ['&', '|']          ["B1", "A2", "A1"]
+        apply operator OR   ['&']               ["B1", "A1 or A2"]
+        apply operator AND  []                  ["(A1 or A2) and B1"]
+        =================== =================== =====================
+
+        Some internal var explanation:
+
+        :var list path: left operand seen as a sequence of field names
+            ("foo.bar" -> ["foo", "bar"])
+        :var obj model: model object, model containing the field
+            (the name provided in the left operand)
+        :var obj field: the field corresponding to `path[0]`
+        :var obj column: the column corresponding to `path[0]`
+        :var obj comodel: relational model of field (field.comodel)
+            (res_partner.bank_ids -> res.partner.bank)
         """
-        cr, uid, context, su = self.root_model.env.args
-
         def to_ids(value, comodel, leaf):
             """ Normalize a single id or name, or a list of those, into a list of ids
-                :param {int,long,basestring,list,tuple} value:
-                    if int, long -> return [value]
-                    if basestring, convert it into a list of basestrings, then
-                    if list of basestring ->
-                        perform a name_search on comodel for each name
-                        return the list of related ids
+
+            :param comodel:
+            :param leaf:
+            :param int|str|list|tuple value:
+
+                - if int, long -> return [value]
+                - if basestring, convert it into a list of basestrings, then
+                - if list of basestring ->
+
+                    - perform a name_search on comodel for each name
+                    - return the list of related ids
             """
             names = []
             if isinstance(value, str):
@@ -875,30 +904,33 @@ class expression(object):
                         dom = HIERARCHY_FUNCS[operator]('id', ids2, model, parent=left)
                     for dom_leaf in dom:
                         push(dom_leaf, model, alias)
-                else:
-                    def _get_expression(comodel, left, right, operator):
-                        #Special treatment to ill-formed domains
-                        operator = (operator in ['<', '>', '<=', '>=']) and 'in' or operator
 
-                        dict_op = {'not in': '!=', 'in': '=', '=': 'in', '!=': 'not in'}
-                        if isinstance(right, tuple):
-                            right = list(right)
-                        if (not isinstance(right, list)) and operator in ['not in', 'in']:
-                            operator = dict_op[operator]
-                        elif isinstance(right, list) and operator in ['!=', '=']:  # for domain (FIELD,'=',['value1','value2'])
-                            operator = dict_op[operator]
-                        res_ids = comodel.with_context(active_test=False)._name_search(right, [], operator, limit=None)
-                        if operator in NEGATIVE_TERM_OPERATORS:
-                            res_ids = list(res_ids) + [False]  # TODO this should not be appended if False was in 'right'
-                        return left, 'in', res_ids
-                    # resolve string-based m2o criterion into IDs
-                    if isinstance(right, str) or \
-                            isinstance(right, (tuple, list)) and right and all(isinstance(item, str) for item in right):
-                        push(_get_expression(comodel, left, right, operator), model, alias)
+                elif (
+                    isinstance(right, str)
+                    or isinstance(right, (tuple, list)) and right and all(isinstance(item, str) for item in right)
+                ):
+                    # resolve string-based m2o criterion into IDs subqueries
+
+                    # Special treatment to ill-formed domains
+                    operator = 'in' if operator in ('<', '>', '<=', '>=') else operator
+                    dict_op = {'not in': '!=', 'in': '=', '=': 'in', '!=': 'not in'}
+                    if isinstance(right, tuple):
+                        right = list(right)
+                    if not isinstance(right, list) and operator in ('not in', 'in'):
+                        operator = dict_op[operator]
+                    elif isinstance(right, list) and operator in ('!=', '='):  # for domain (FIELD,'=',['value1','value2'])
+                        operator = dict_op[operator]
+                    res_ids = comodel.with_context(active_test=False)._name_search(right, [], operator, limit=None)
+                    if operator in NEGATIVE_TERM_OPERATORS:
+                        for dom_leaf in ('|', (left, 'in', res_ids), (left, '=', False)):
+                            push(dom_leaf, model, alias)
                     else:
-                        # right == [] or right == False and all other cases are handled by __leaf_to_sql()
-                        expr, params = self.__leaf_to_sql(leaf, model, alias)
-                        push_result(expr, params)
+                        push((left, 'in', res_ids), model, alias)
+
+                else:
+                    # right == [] or right == False and all other cases are handled by __leaf_to_sql()
+                    expr, params = self.__leaf_to_sql(leaf, model, alias)
+                    push_result(expr, params)
 
             # -------------------------------------------------
             # BINARY FIELDS STORED IN ATTACHMENT
@@ -941,20 +973,66 @@ class expression(object):
                         expr, params = self.__leaf_to_sql(leaf, model, alias)
                         push_result(expr, params)
 
-                elif field.translate is True and right:
-                    need_wildcard = operator in ('like', 'ilike', 'not like', 'not ilike')
+                elif field.translate and isinstance(right, str):
                     sql_operator = {'=like': 'like', '=ilike': 'ilike'}.get(operator, operator)
+                    expr = ''
+                    params = []
+
+                    need_wildcard = operator in ('like', 'ilike', 'not like', 'not ilike')
+                    if not need_wildcard:
+                        right = field.convert_to_column(right, model, validate=False).adapted['en_US']
+
+                    if (need_wildcard and not right) or (right and sql_operator in NEGATIVE_TERM_OPERATORS):
+                        expr += f'"{alias}"."{left}" is NULL OR '
+
+                    if self._has_trigram and field.index == 'trigram' and sql_operator in ('=', 'like', 'ilike'):
+                        # a prefilter using trigram index to speed up '=', 'like', 'ilike'
+                        # '!=', '<=', '<', '>', '>=', 'in', 'not in', 'not like', 'not ilike' cannot use this trick
+                        if sql_operator == '=':
+                            _right = sql.value_to_translated_trigram_pattern(right)
+                        else:
+                            _right = sql.pattern_to_translated_trigram_pattern(right)
+
+                        if _right != '%':
+                            _unaccent = self._unaccent(field)
+                            _left = _unaccent(f'''jsonb_path_query_array("{alias}"."{left}", '$.*')::text''')
+                            _sql_operator = 'like' if sql_operator == '=' else sql_operator
+                            expr += f"{_left} {_sql_operator} {_unaccent('%s')} AND "
+                            params.append(_right)
+
+                    unaccent = self._unaccent(field) if sql_operator.endswith('like') else lambda x: x
+                    lang = model.env.lang or 'en_US'
+                    if lang == 'en_US':
+                        left = unaccent(f""""{alias}"."{left}"->>'en_US'""")
+                    else:
+                        left = unaccent(f'''COALESCE("{alias}"."{left}"->>'{lang}', "{alias}"."{left}"->>'en_US')''')
+
                     if need_wildcard:
-                        right = '%%%s%%' % right
-                    if sql_operator in ('in', 'not in'):
-                        right = tuple(right)
+                        right = f'%{right}%'
 
-                    unaccent = self._unaccent if sql_operator.endswith('like') else lambda x: x
+                    expr += f"{left} {sql_operator} {unaccent('%s')}"
+                    params.append(right)
+                    push_result(f'({expr})', params)
 
-                    left = unaccent(model._generate_translated_field(alias, left, self.query))
-                    instr = unaccent('%s')
-                    push_result(f"{left} {sql_operator} {instr}", [right])
-
+                elif field.translate and operator in ['in', 'not in'] and isinstance(right, (list, tuple)):
+                    params = [it for it in right if it is not False and it is not None]
+                    check_null = len(params) < len(right)
+                    if params:
+                        params = [field.convert_to_column(p, model, validate=False).adapted['en_US'] for p in params]
+                        lang = model.env.lang or 'en_US'
+                        if lang == 'en_US':
+                            query = f'''("{alias}"."{left}"->>'en_US' {operator} %s)'''
+                        else:
+                            query = f'''(COALESCE("{alias}"."{left}"->>'{lang}', "{alias}"."{left}"->>'en_US') {operator} %s)'''
+                        params = [tuple(params)]
+                    else:
+                        # The case for (left, 'in', []) or (left, 'not in', []).
+                        query = 'FALSE' if operator == 'in' else 'TRUE'
+                    if (operator == 'in' and check_null) or (operator == 'not in' and not check_null):
+                        query = '(%s OR %s."%s" IS NULL)' % (query, alias, left)
+                    elif operator == 'not in' and check_null:
+                        query = '(%s AND %s."%s" IS NOT NULL)' % (query, alias, left)  # needed only for TRUE.
+                    push_result(query, params)
                 else:
                     expr, params = self.__leaf_to_sql(leaf, model, alias)
                     push_result(expr, params)
@@ -1016,16 +1094,14 @@ class expression(object):
                     params = [it for it in (True, False) if it in right]
                     check_null = False in right
                 else:
-                    params = [it for it in right if it != False]
+                    params = [it for it in right if it is not False and it is not None]
                     check_null = len(params) < len(right)
                 if params:
-                    if left == 'id':
-                        instr = ','.join(['%s'] * len(params))
-                    else:
+                    if left != 'id':
                         field = model._fields[left]
-                        instr = ','.join([field.column_format] * len(params))
                         params = [field.convert_to_column(p, model, validate=False) for p in params]
-                    query = '(%s."%s" %s (%s))' % (table_alias, left, operator, instr)
+                    query = f'({table_alias}."{left}" {operator} %s)'
+                    params = [tuple(params)]
                 else:
                     # The case for (left, 'in', []) or (left, 'not in', []).
                     query = 'FALSE' if operator == 'in' else 'TRUE'
@@ -1062,16 +1138,17 @@ class expression(object):
                 query, params = self.__leaf_to_sql((left, '=', right), model, alias)
 
         else:
+            field = model._fields.get(left)
+            if field is None:
+                raise ValueError("Invalid field %r in domain term %r" % (left, leaf))
+
             need_wildcard = operator in ('like', 'ilike', 'not like', 'not ilike')
             sql_operator = {'=like': 'like', '=ilike': 'ilike'}.get(operator, operator)
-            cast = '::text' if  sql_operator.endswith('like') else ''
+            cast = '::text' if sql_operator.endswith('like') else ''
 
-            if left not in model:
-                raise ValueError("Invalid field %r in domain term %r" % (left, leaf))
-            format = '%s' if need_wildcard else model._fields[left].column_format
-            unaccent = self._unaccent if sql_operator.endswith('like') else lambda x: x
+            unaccent = self._unaccent(field) if sql_operator.endswith('like') else lambda x: x
             column = '%s.%s' % (table_alias, _quote(left))
-            query = '(%s %s %s)' % (unaccent(column + cast), sql_operator, unaccent(format))
+            query = f'({unaccent(column + cast)} {sql_operator} {unaccent("%s")})'
 
             if (need_wildcard and not right) or (right and operator in NEGATIVE_TERM_OPERATORS):
                 query = '(%s OR %s."%s" IS NULL)' % (query, table_alias, left)
@@ -1079,7 +1156,6 @@ class expression(object):
             if need_wildcard:
                 params = ['%%%s%%' % pycompat.to_text(right)]
             else:
-                field = model._fields[left]
                 params = [field.convert_to_column(right, model, validate=False)]
 
         return query, params

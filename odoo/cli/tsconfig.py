@@ -1,19 +1,18 @@
+# Part of Odoo. See LICENSE file for full copyright and licensing details.
 import argparse
 import glob
 import json
 import os
 import re
 import sys
+from pathlib import Path
 
 from . import Command
 from odoo.modules.module import MANIFEST_NAMES
 
 
 class TSConfig(Command):
-    """Generates tsconfig files for javascript code"""
-
-    def __init__(self):
-        self.command_name = "tsconfig"
+    """ Generates tsconfig files for javascript code """
 
     def get_module_list(self, path):
         return [
@@ -35,19 +34,23 @@ class TSConfig(Command):
 
     def run(self, cmdargs):
         parser = argparse.ArgumentParser(
-            prog="%s %s" % (sys.argv[0].split(os.path.sep)[-1], self.command_name),
-            description=self.__doc__
+            prog=f'{Path(sys.argv[0]).name} {self.name}',
+            description=self.__doc__.strip()
         )
         parser.add_argument('--addons-path', type=str, nargs=1, dest="paths")
         args = parser.parse_args(args=cmdargs)
 
         paths = list(map(self.clean_path, args.paths[0].split(',')))
         modules = {}
+        owl_path = ""
         for path in paths:
             for module in self.get_module_list(path):
                 modules[module] = self.prefix_suffix_path(module, path, "/static/src/*")
+                if module == "web":
+                    owl_path = self.prefix_suffix_path(module, path, "/static/lib/owl/owl.js")
 
         content = self.generate_file_content(modules, paths)
+        content["compilerOptions"]["paths"]["@odoo/owl"] = [owl_path]
         # pylint: disable=bad-builtin
         print(json.dumps(content, indent=2))
 

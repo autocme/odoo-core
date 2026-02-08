@@ -67,3 +67,17 @@ class Eggs(models.Model):
     _description = 'Test Performance Eggs'
 
     name = fields.Char()
+
+
+class Mozzarella(models.Model):
+    _name = 'test_performance.mozzarella'
+    _description = 'Test Performance Mozzarella'
+
+    value = fields.Integer(default=0, required=True)
+    value_plus_one = fields.Integer(compute="_value_plus_one", required=True, store=True)
+    value_null_by_default = fields.Integer()
+
+    @api.depends('value')
+    def _value_plus_one(self):
+        for record in self:
+            record.value_plus_one = record.value + 1

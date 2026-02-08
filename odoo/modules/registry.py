@@ -13,15 +13,18 @@ import logging
 import os
 import threading
 import time
+import warnings
 
 import psycopg2
 
 import odoo
+from odoo.modules.db import FunctionStatus
+from odoo.osv.expression import get_unaccent_wrapper
 from .. import SUPERUSER_ID
 from odoo.sql_db import TestCursor
-from odoo.tools import (config, existing_tables, ignore,
-                        lazy_classproperty, lazy_property, sql,
-                        Collector, OrderedSet)
+from odoo.tools import (config, existing_tables, lazy_classproperty,
+                        lazy_property, sql, Collector, OrderedSet)
+from odoo.tools.func import locked
 from odoo.tools.lru import LRU
 
 _logger = logging.getLogger(__name__)
@@ -61,47 +64,43 @@ class Registry(Mapping):
                 return cls.registries[db_name]
             except KeyError:
                 return cls.new(db_name)
-            finally:
-                # set db tracker - cleaned up at the WSGI dispatching phase in
-                # odoo.service.wsgi_server.application
-                threading.current_thread().dbname = db_name
 
     @classmethod
+    @locked
     def new(cls, db_name, force_demo=False, status=None, update_module=False):
         """ Create and return a new registry for the given database name. """
         t0 = time.time()
-        with cls._lock:
-            registry = object.__new__(cls)
-            registry.init(db_name)
-            registry.new = registry.init = registry.registries = None
+        registry = object.__new__(cls)
+        registry.init(db_name)
+        registry.new = registry.init = registry.registries = None
 
-            # Initializing a registry will call general code which will in
-            # turn call Registry() to obtain the registry being initialized.
-            # Make it available in the registries dictionary then remove it
-            # if an exception is raised.
-            cls.delete(db_name)
-            cls.registries[db_name] = registry  # pylint: disable=unsupported-assignment-operation
+        # Initializing a registry will call general code which will in
+        # turn call Registry() to obtain the registry being initialized.
+        # Make it available in the registries dictionary then remove it
+        # if an exception is raised.
+        cls.delete(db_name)
+        cls.registries[db_name] = registry  # pylint: disable=unsupported-assignment-operation
+        try:
+            registry.setup_signaling()
+            # This should be a method on Registry
             try:
-                registry.setup_signaling()
-                # This should be a method on Registry
-                try:
-                    odoo.modules.load_modules(registry, force_demo, status, update_module)
-                except Exception:
-                    odoo.modules.reset_modules_state(db_name)
-                    raise
+                odoo.modules.load_modules(registry, force_demo, status, update_module)
             except Exception:
-                _logger.exception('Failed to load registry')
-                del cls.registries[db_name]     # pylint: disable=unsupported-delete-operation
+                odoo.modules.reset_modules_state(db_name)
                 raise
+        except Exception:
+            _logger.exception('Failed to load registry')
+            del cls.registries[db_name]     # pylint: disable=unsupported-delete-operation
+            raise
 
-            # load_modules() above can replace the registry by calling
-            # indirectly new() again (when modules have to be uninstalled).
-            # Yeah, crazy.
-            registry = cls.registries[db_name]  # pylint: disable=unsubscriptable-object
+        # load_modules() above can replace the registry by calling
+        # indirectly new() again (when modules have to be uninstalled).
+        # Yeah, crazy.
+        registry = cls.registries[db_name]  # pylint: disable=unsubscriptable-object
 
-            registry._init = False
-            registry.ready = True
-            registry.registry_invalidated = bool(update_module)
+        registry._init = False
+        registry.ready = True
+        registry.registry_invalidated = bool(update_module)
 
         _logger.info("Registry loaded in %.3fs", time.time() - t0)
         return registry
@@ -110,7 +109,8 @@ class Registry(Mapping):
         self.models = {}    # model name/model instance mapping
         self._sql_constraints = set()
         self._init = True
-        self._assertion_report = odoo.tests.runner.OdooTestResult()
+        self._database_translated_fields = ()  # names of translated fields in database
+        self._assertion_report = odoo.tests.result.OdooTestResult()
         self._fields_by_model = None
         self._ordinary_tables = None
         self._constraint_queue = deque()
@@ -137,6 +137,10 @@ class Registry(Mapping):
         self.field_depends_context = Collector()
         self.field_inverses = Collector()
 
+        # cache of methods get_field_trigger_tree() and is_modifying_relations()
+        self._field_trigger_trees = {}
+        self._is_modifying_relations = {}
+
         # Inter-process signaling:
         # The `base_registry_signaling` sequence indicates the whole registry
         # must be reloaded.
@@ -153,17 +157,17 @@ class Registry(Mapping):
             self.has_trigram = odoo.modules.db.has_trigram(cr)
 
     @classmethod
+    @locked
     def delete(cls, db_name):
         """ Delete the registry linked to a given database. """
-        with cls._lock:
-            if db_name in cls.registries:
-                del cls.registries[db_name]
+        if db_name in cls.registries:  # pylint: disable=unsupported-membership-test
+            del cls.registries[db_name]  # pylint: disable=unsupported-delete-operation
 
     @classmethod
+    @locked
     def delete_all(cls):
         """ Delete all the registries. """
-        with cls._lock:
-            cls.registries.clear()
+        cls.registries.clear()
 
     #
     # Mapping abstract methods implementation
@@ -228,6 +232,8 @@ class Registry(Mapping):
         self.__cache.clear()
 
         lazy_property.reset_all(self)
+        self._field_trigger_trees.clear()
+        self._is_modifying_relations.clear()
 
         # Instantiate registered classes (via the MetaModel automatic discovery
         # or via explicit constructor call), and add them to the pool.
@@ -239,12 +245,13 @@ class Registry(Mapping):
 
         return self.descendants(model_names, '_inherit', '_inherits')
 
+    @locked
     def setup_models(self, cr):
         """ Complete the setup of models.
             This must be called after loading modules and before using the ORM.
         """
         env = odoo.api.Environment(cr, SUPERUSER_ID, {})
-        env['base'].flush()
+        env.invalidate_all()
 
         # Uninstall registry hooks. Because of the condition, this only happens
         # on a fully loaded registry, and not on a registry being loaded.
@@ -256,13 +263,9 @@ class Registry(Mapping):
         self.__cache.clear()
 
         lazy_property.reset_all(self)
+        self._field_trigger_trees.clear()
+        self._is_modifying_relations.clear()
         self.registry_invalidated = True
-
-        if env.all.tocompute:
-            _logger.error(
-                "Remaining fields to compute before setting up registry: %s",
-                env.all.tocompute, stack_info=True,
-            )
 
         # we must setup ir.model before adding manual fields because _add_manual_models may
         # depend on behavior that is implemented through overrides, such as is_mail_thread which
@@ -301,12 +304,15 @@ class Registry(Mapping):
                 self.field_depends[field] = tuple(depends)
                 self.field_depends_context[field] = tuple(depends_context)
 
+        # clean the lazy_property again in case they are cached by another ongoing registry readonly request
+        lazy_property.reset_all(self)
+
         # Reinstall registry hooks. Because of the condition, this only happens
         # on a fully loaded registry, and not on a registry being loaded.
         if self.ready:
             for model in env.values():
                 model._register_hook()
-            env['base'].flush()
+            env.flush_all()
 
     @lazy_property
     def field_computed(self):
@@ -322,49 +328,141 @@ class Registry(Mapping):
                 if len({field.compute_sudo for field in fields}) > 1:
                     _logger.warning("%s: inconsistent 'compute_sudo' for computed fields: %s",
                                     model_name, ", ".join(field.name for field in fields))
+                if len({field.precompute for field in fields}) > 1:
+                    _logger.warning("%s: inconsistent 'precompute' for computed fields: %s",
+                                    model_name, ", ".join(field.name for field in fields))
         return computed
 
-    @lazy_property
-    def field_triggers(self):
-        # determine field dependencies
-        dependencies = {}
-        for Model in self.models.values():
-            if Model._abstract:
-                continue
-            for field in Model._fields.values():
-                # dependencies of custom fields may not exist; ignore that case
-                exceptions = (Exception,) if field.base_field.manual else ()
-                with ignore(*exceptions):
-                    dependencies[field] = OrderedSet(field.resolve_depends(self))
+    def get_trigger_tree(self, fields: list, select=bool) -> "TriggerTree":
+        """ Return the trigger tree to traverse when ``fields`` have been modified.
+        The function ``select`` is called on every field to determine which fields
+        should be kept in the tree nodes.  This enables to discard some unnecessary
+        fields from the tree nodes.
+        """
+        trees = [
+            self.get_field_trigger_tree(field)
+            for field in fields
+            if field in self._field_triggers
+        ]
+        return TriggerTree.merge(trees, select)
 
-        # determine transitive dependencies
-        def transitive_dependencies(field, seen=[]):
-            if field in seen:
+    def get_dependent_fields(self, field):
+        """ Return an iterable on the fields that depend on ``field``. """
+        if field not in self._field_triggers:
+            return ()
+
+        return (
+            dependent
+            for tree in self.get_field_trigger_tree(field).depth_first()
+            for dependent in tree.root
+        )
+
+    def _discard_fields(self, fields: list):
+        """ Discard the given fields from the registry's internal data structures. """
+        for f in fields:
+            # tests usually don't reload the registry, so when they create
+            # custom fields those may not have the entire dependency setup, and
+            # may be missing from these maps
+            self.field_depends.pop(f, None)
+
+        # discard fields from field triggers
+        self.__dict__.pop('_field_triggers', None)
+        self._field_trigger_trees.clear()
+        self._is_modifying_relations.clear()
+
+        # discard fields from field inverses
+        self.field_inverses.discard_keys_and_values(fields)
+
+    def get_field_trigger_tree(self, field) -> "TriggerTree":
+        """ Return the trigger tree of a field by computing it from the transitive
+        closure of field triggers.
+        """
+        try:
+            return self._field_trigger_trees[field]
+        except KeyError:
+            pass
+
+        triggers = self._field_triggers
+
+        if field not in triggers:
+            return TriggerTree()
+
+        def transitive_triggers(field, prefix=(), seen=()):
+            if field in seen or field not in triggers:
                 return
-            for seq1 in dependencies.get(field, ()):
-                yield seq1
-                for seq2 in transitive_dependencies(seq1[-1], seen + [field]):
-                    yield concat(seq1[:-1], seq2)
+            for path, targets in triggers[field].items():
+                full_path = concat(prefix, path)
+                yield full_path, targets
+                for target in targets:
+                    yield from transitive_triggers(target, full_path, seen + (field,))
 
         def concat(seq1, seq2):
             if seq1 and seq2:
                 f1, f2 = seq1[-1], seq2[0]
-                if f1.type == 'one2many' and f2.type == 'many2one' and \
-                        f1.model_name == f2.comodel_name and f1.inverse_name == f2.name:
+                if (
+                    f1.type == 'many2one' and f2.type == 'one2many'
+                    and f1.name == f2.inverse_name
+                    and f1.model_name == f2.comodel_name
+                    and f1.comodel_name == f2.model_name
+                ):
                     return concat(seq1[:-1], seq2[1:])
             return seq1 + seq2
 
-        # determine triggers based on transitive dependencies
-        triggers = {}
-        for field in dependencies:
-            for path in transitive_dependencies(field):
-                if path:
-                    tree = triggers
-                    for label in reversed(path):
-                        tree = tree.setdefault(label, {})
-                    tree.setdefault(None, OrderedSet()).add(field)
+        tree = TriggerTree()
+        for path, targets in transitive_triggers(field):
+            current = tree
+            for label in path:
+                current = current.increase(label)
+            if current.root:
+                current.root.update(targets)
+            else:
+                current.root = OrderedSet(targets)
+
+        self._field_trigger_trees[field] = tree
+
+        return tree
+
+    @lazy_property
+    def _field_triggers(self):
+        """ Return the field triggers, i.e., the inverse of field dependencies,
+        as a dictionary like ``{field: {path: fields}}``, where ``field`` is a
+        dependency, ``path`` is a sequence of fields to inverse and ``fields``
+        is a collection of fields that depend on ``field``.
+        """
+        triggers = defaultdict(lambda: defaultdict(OrderedSet))
+
+        for Model in self.models.values():
+            if Model._abstract:
+                continue
+            for field in Model._fields.values():
+                try:
+                    dependencies = list(field.resolve_depends(self))
+                except Exception:
+                    # dependencies of custom fields may not exist; ignore that case
+                    if not field.base_field.manual:
+                        raise
+                else:
+                    for dependency in dependencies:
+                        *path, dep_field = dependency
+                        triggers[dep_field][tuple(reversed(path))].add(field)
 
         return triggers
+
+    def is_modifying_relations(self, field):
+        """ Return whether ``field`` has dependent fields on some records, and
+        that modifying ``field`` might change the dependent records.
+        """
+        try:
+            return self._is_modifying_relations[field]
+        except KeyError:
+            result = field in self._field_triggers and (
+                field.relational or self.field_inverses[field] or any(
+                    dep.relational or self.field_inverses[dep]
+                    for dep in self.get_dependent_fields(field)
+                )
+            )
+            self._is_modifying_relations[field] = result
+            return result
 
     def post_init(self, func, *args, **kwargs):
         """ Register a function to call at the end of :meth:`~.init_models`. """
@@ -442,7 +540,7 @@ class Registry(Mapping):
             self.check_indexes(cr, model_names)
             self.check_foreign_keys(cr)
 
-            env['base'].flush()
+            env.flush_all()
 
             # make sure all tables are present
             self.check_tables_exist(cr)
@@ -455,7 +553,7 @@ class Registry(Mapping):
     def check_indexes(self, cr, model_names):
         """ Create or drop column indexes for the given models. """
         expected = [
-            ("%s_%s_index" % (Model._table, field.name), Model._table, field.name, field.index)
+            (f"{Model._table}_{field.name}_index", Model._table, field, getattr(field, 'unaccent', False))
             for model_name in model_names
             for Model in [self.models[model_name]]
             if Model._auto and not Model._abstract
@@ -470,11 +568,37 @@ class Registry(Mapping):
                    [tuple(row[0] for row in expected)])
         existing = dict(cr.fetchall())
 
-        for indexname, tablename, columnname, index in expected:
-            if index and indexname not in existing:
+        for indexname, tablename, field, unaccent in expected:
+            column_expression = f'"{field.name}"'
+            index = field.index
+            assert index in ('btree', 'btree_not_null', 'trigram', True, False, None)
+            if index and indexname not in existing and \
+                    ((not field.translate and index != 'trigram') or (index == 'trigram' and self.has_trigram)):
+
+                if index == 'trigram':
+                    if field.translate:
+                        column_expression = f'''(jsonb_path_query_array({column_expression}, '$.*')::text)'''
+                    # add `unaccent` to the trigram index only because the
+                    # trigram indexes are mainly used for (i/=)like search and
+                    # unaccent is added only in these cases when searching
+                    if unaccent and self.has_unaccent:
+                        if self.has_unaccent == FunctionStatus.INDEXABLE:
+                            column_expression = get_unaccent_wrapper(cr)(column_expression)
+                        else:
+                            warnings.warn(
+                                "PostgreSQL function 'unaccent' is present but not immutable, "
+                                "therefore trigram indexes may not be effective.",
+                            )
+                    expression = f'{column_expression} gin_trgm_ops'
+                    method = 'gin'
+                    where = ''
+                else:  # index in ['btree', 'btree_not_null'， True]
+                    expression = f'{column_expression}'
+                    method = 'btree'
+                    where = f'{column_expression} IS NOT NULL' if index == 'btree_not_null' else ''
                 try:
                     with cr.savepoint(flush=False):
-                        sql.create_index(cr, indexname, tablename, ['"%s"' % columnname])
+                        sql.create_index(cr, indexname, tablename, [expression], method, where)
                 except psycopg2.OperationalError:
                     _schema.error("Unable to add index for %s", self)
 
@@ -547,7 +671,7 @@ class Registry(Mapping):
             for name in missing:
                 _logger.info("Recreate table of model %s.", name)
                 env[name].init()
-            env['base'].flush()
+            env.flush_all()
             # check again, and log errors if tables are still missing
             missing_tables = set(table2model).difference(existing_tables(cr, table2model))
             for table in missing_tables:
@@ -724,7 +848,7 @@ class Registry(Mapping):
         """
         if self.test_cr is not None:
             # in test mode we use a proxy object that uses 'self.test_cr' underneath
-            return TestCursor(self.test_cr, self.test_lock)
+            return TestCursor(self.test_cr, self.test_lock, current_test=odoo.modules.module.current_test)
         return self._db.cursor()
 
 
@@ -738,3 +862,70 @@ class DummyRLock(object):
         self.acquire()
     def __exit__(self, type, value, traceback):
         self.release()
+
+
+class TriggerTree(dict):
+    """ The triggers of a field F is a tree that contains the fields that
+    depend on F, together with the fields to inverse to find out which records
+    to recompute.
+
+    For instance, assume that G depends on F, H depends on X.F, I depends on
+    W.X.F, and J depends on Y.F. The triggers of F will be the tree:
+
+                                 [G]
+                               X/   \\Y
+                             [H]     [J]
+                           W/
+                         [I]
+
+    This tree provides perfect support for the trigger mechanism:
+    when F is # modified on records,
+     - mark G to recompute on records,
+     - mark H to recompute on inverse(X, records),
+     - mark I to recompute on inverse(W, inverse(X, records)),
+     - mark J to recompute on inverse(Y, records).
+    """
+    __slots__ = ['root']
+
+    # pylint: disable=keyword-arg-before-vararg
+    def __init__(self, root=(), *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.root = root
+
+    def __bool__(self):
+        return bool(self.root or len(self))
+
+    def increase(self, key):
+        try:
+            return self[key]
+        except KeyError:
+            subtree = self[key] = TriggerTree()
+            return subtree
+
+    def depth_first(self):
+        yield self
+        for subtree in self.values():
+            yield from subtree.depth_first()
+
+    @classmethod
+    def merge(cls, trees: list, select=bool) -> "TriggerTree":
+        """ Merge trigger trees into a single tree. The function ``select`` is
+        called on every field to determine which fields should be kept in the
+        tree nodes. This enables to discard some fields from the tree nodes.
+        """
+        root_fields = OrderedSet()              # fields in the root node
+        subtrees_to_merge = defaultdict(list)   # subtrees to merge grouped by key
+
+        for tree in trees:
+            root_fields.update(tree.root)
+            for label, subtree in tree.items():
+                subtrees_to_merge[label].append(subtree)
+
+        # the root node contains the collected fields for which select is true
+        result = cls([field for field in root_fields if select(field)])
+        for label, subtrees in subtrees_to_merge.items():
+            subtree = cls.merge(subtrees, select)
+            if subtree:
+                result[label] = subtree
+
+        return result

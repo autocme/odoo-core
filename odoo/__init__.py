@@ -88,10 +88,10 @@ try:
 except ImportError:
     pass # no fix required
 
-#----------------------------------------------------------
+# ---------------------------------------------------------
 # some charset are known by Python under a different name
-#----------------------------------------------------------
-import encodings.aliases
+# ---------------------------------------------------------
+import encodings.aliases  # noqa: E402
 
 encodings.aliases.aliases['874'] = 'cp874'
 encodings.aliases.aliases['windows_874'] = 'cp874'

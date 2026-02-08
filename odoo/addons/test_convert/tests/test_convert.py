@@ -188,10 +188,87 @@ class TestEvalXML(common.TransactionCase):
         self.assertEqual(args, ())
         self.assertEqual(kwargs, {})
 
+    def test_o2m_sub_records(self):
+        # patch the model's class with a proxy that copies the argument
+        Model = self.registry['test_convert.test_model']
+        call_args = []
+
+        def _load_records(self, data_list, update=False):
+            call_args.append(data_list)
+            # pylint: disable=bad-super-call
+            return super(Model, self)._load_records(data_list, update=update)
+
+        self.patch(Model, '_load_records', _load_records)
+
+        # import a record with a subrecord
+        xml = ET.fromstring("""
+            <record id="test_convert.test_o2m_record" model="test_convert.test_model">
+                <field name="usered_ids">
+                    <record id="test_convert.test_o2m_subrecord" model="test_convert.usered">
+                        <field name="name">subrecord</field>
+                    </record>
+                </field>
+            </record>
+        """.strip())
+        obj = xml_import(self.cr, 'test_convert', None, 'init')
+        obj._tag_record(xml)
+
+        # check that field 'usered_ids' is not passed
+        self.assertEqual(len(call_args), 1)
+        for data in call_args[0]:
+            self.assertNotIn('usered_ids', data['values'],
+                             "Unexpected value in O2M When loading XML with sub records")
+
+    def test_o2m_sub_records_noupdate(self):
+        xml = ET.fromstring("""
+            <data noupdate="1">
+              <record id="test_convert.test_o2m_record_noup" model="test_convert.test_model">
+                <field name="usered_ids">
+                    <record id="test_convert.test_o2m_subrecord_noup" model="test_convert.usered">
+                        <field name="name">subrecord</field>
+                    </record>
+                </field>
+              </record>
+            </data>
+        """.strip())
+
+        xmlids = {"test_convert.test_o2m_record_noup", "test_convert.test_o2m_subrecord_noup"}
+
+        # create records
+        xml_import(self.cr, 'test_convert', None, 'init').parse(xml)
+
+        # clear loaded xmlids
+        self.registry.loaded_xmlids.difference_update(xmlids)
+
+        # reload the xml in update mode
+        idref = {}
+        xml_import(self.cr, 'test_convert', idref, 'update').parse(xml)
+
+        self.assertEqual(set(idref.keys()), xmlids)
+        self.assertTrue(self.registry.loaded_xmlids.issuperset(xmlids))
+
     @unittest.skip("not tested")
     def test_xml(self):
         pass
 
-    @unittest.skip("not tested")
     def test_html(self):
-        pass
+        self.assertEqual(
+            self.eval_xml(Field(ET.fromstring(
+            """<parent>
+                <t t-if="True">
+                    <t t-out="'text'"/>
+                </t>
+                <t t-else="">
+                    <t t-out="'text2'"></t>
+                </t>
+            </parent>"""), type="html")),
+            """<parent>
+                <t t-if="True">
+                    <t t-out="'text'"></t>
+                </t>
+                <t t-else="">
+                    <t t-out="'text2'"></t>
+                </t>
+            </parent>""",
+            "Evaluating an HTML field should give empty nodes instead of self-closing tags"
+        )

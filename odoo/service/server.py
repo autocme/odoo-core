@@ -16,11 +16,15 @@ import sys
 import threading
 import time
 import unittest
+import contextlib
+from io import BytesIO
 from itertools import chain
 
 import psutil
 import werkzeug.serving
 from werkzeug.debug import DebuggedApplication
+
+from ..tests import loader
 
 if os.name == 'posix':
     # Unix only for workers
@@ -58,7 +62,6 @@ from odoo.modules.registry import Registry
 from odoo.release import nt_service_name
 from odoo.tools import config
 from odoo.tools import stripped_sys_argv, dumpstacks, log_ormcache_stats
-from ..tests import loader, runner
 
 _logger = logging.getLogger(__name__)
 
@@ -77,8 +80,8 @@ def memory_info(process):
 
 
 def set_limit_memory_hard():
-    if os.name == 'posix' and config['limit_memory_hard']:
-        rlimit = resource.RLIMIT_RSS if platform.system() == 'Darwin' else resource.RLIMIT_AS
+    if platform.system() == 'Linux' and config['limit_memory_hard']:
+        rlimit = resource.RLIMIT_AS
         soft, hard = resource.getrlimit(rlimit)
         resource.setrlimit(rlimit, (config['limit_memory_hard'], hard))
 
@@ -126,6 +129,42 @@ class RequestHandler(werkzeug.serving.WSGIRequestHandler):
         me = threading.current_thread()
         me.name = 'odoo.service.http.request.%s' % (me.ident,)
 
+    def make_environ(self):
+        environ = super().make_environ()
+        # Add the TCP socket to environ in order for the websocket
+        # connections to use it.
+        environ['socket'] = self.connection
+        if self.headers.get('Upgrade') == 'websocket':
+            # Since the upgrade header is introduced in version 1.1, Firefox
+            # won't accept a websocket connection if the version is set to
+            # 1.0.
+            self.protocol_version = "HTTP/1.1"
+        return environ
+
+    def send_header(self, keyword, value):
+        # Prevent `WSGIRequestHandler` from sending the connection close header (compatibility with werkzeug >= 2.1.1 )
+        # since it is incompatible with websocket.
+        if self.headers.get('Upgrade') == 'websocket' and keyword == 'Connection' and value == 'close':
+            # Do not keep processing requests.
+            self.close_connection = True
+            return
+        super().send_header(keyword, value)
+
+    def end_headers(self, *a, **kw):
+        super().end_headers(*a, **kw)
+        # At this point, Werkzeug assumes the connection is closed and will discard any incoming
+        # data. In the case of WebSocket connections, data should not be discarded. Replace the
+        # rfile/wfile of this handler to prevent any further action (compatibility with werkzeug >= 2.3.x).
+        # See: https://github.com/pallets/werkzeug/blob/2.3.x/src/werkzeug/serving.py#L334
+        if self.headers.get('Upgrade') == 'websocket':
+            self.rfile = BytesIO()
+            self.wfile = BytesIO()
+
+    def log_error(self, format, *args):
+        if format == "Request timed out: %r" and config['test_enable']:
+            _logger.info(format, *args)
+        else:
+            super().log_error(format, *args)
 
 class ThreadedWSGIServerReloadable(LoggingBaseWSGIServerMixIn, werkzeug.serving.ThreadedWSGIServer):
     """ werkzeug Threaded WSGI Server patched to allow reusing a listen socket
@@ -304,9 +343,10 @@ class FSWatcherInotify(FSWatcherBase):
 #----------------------------------------------------------
 
 class CommonServer(object):
+    _on_stop_funcs = []
+
     def __init__(self, app):
         self.app = app
-        self._on_stop_funcs = []
         # config
         self.interface = config['http_interface'] or '0.0.0.0'
         self.port = config['http_port']
@@ -334,9 +374,10 @@ class CommonServer(object):
                 raise
         sock.close()
 
-    def on_stop(self, func):
+    @classmethod
+    def on_stop(cls, func):
         """ Register a cleanup function to be executed when the server stops """
-        self._on_stop_funcs.append(func)
+        cls._on_stop_funcs.append(func)
 
     def stop(self):
         for func in self._on_stop_funcs:
@@ -388,9 +429,10 @@ class ThreadedServer(CommonServer):
             self.limits_reached_threads.add(threading.current_thread())
 
         for thread in threading.enumerate():
-            if not thread.daemon or getattr(thread, 'type', None) == 'cron':
+            thread_type = getattr(thread, 'type', None)
+            if not thread.daemon and thread_type != 'websocket' or thread_type == 'cron':
                 # We apply the limits on cron threads and HTTP requests,
-                # longpolling requests excluded.
+                # websocket requests excluded.
                 if getattr(thread, 'start_time', None):
                     thread_execution_time = time.time() - thread.start_time
                     thread_limit_time_real = config['limit_time_real']
@@ -427,8 +469,7 @@ class ThreadedServer(CommonServer):
         # same time. This is known as the thundering herd effect.
 
         from odoo.addons.base.models.ir_cron import ir_cron
-        conn = odoo.sql_db.db_connect('postgres')
-        with conn.cursor() as cr:
+        def _run_cron(cr):
             pg_conn = cr._cnx
             # LISTEN / NOTIFY doesn't work in recovery mode
             cr.execute("SELECT pg_is_in_recovery()")
@@ -438,8 +479,8 @@ class ThreadedServer(CommonServer):
             else:
                 _logger.warning("PG cluster in recovery mode, cron trigger not activated")
             cr.commit()
-
-            while True:
+            alive_time = time.monotonic()
+            while config['limit_time_worker_cron'] <= 0 or (time.monotonic() - alive_time) <= config['limit_time_worker_cron']:
                 select.select([pg_conn], [], [], SLEEP_INTERVAL + number)
                 time.sleep(number / 100)
                 pg_conn.poll()
@@ -455,6 +496,12 @@ class ThreadedServer(CommonServer):
                         except Exception:
                             _logger.warning('cron%d encountered an Exception:', number, exc_info=True)
                         thread.start_time = None
+        while True:
+            conn = odoo.sql_db.db_connect('postgres')
+            with contextlib.closing(conn.cursor()) as cr:
+                _run_cron(cr)
+                cr._cnx.close()
+            _logger.info('cron%d max age (%ss) reached, releasing connection.', number, config['limit_time_worker_cron'])
 
     def cron_spawn(self):
         """ Start the above runner function in a daemon thread.
@@ -478,9 +525,7 @@ class ThreadedServer(CommonServer):
             _logger.debug("cron%d started!" % i)
 
     def http_thread(self):
-        def app(e, s):
-            return self.app(e, s)
-        self.httpd = ThreadedWSGIServerReloadable(self.interface, self.port, app)
+        self.httpd = ThreadedWSGIServerReloadable(self.interface, self.port, self.app)
         self.httpd.serve_forever()
 
     def http_spawn(self):
@@ -558,7 +603,7 @@ class ThreadedServer(CommonServer):
 
         if stop:
             if config['test_enable']:
-                logger = odoo.tests.runner._logger
+                logger = odoo.tests.result._logger
                 with Registry.registries._lock:
                     for db, registry in Registry.registries.d.items():
                         report = registry._assertion_report
@@ -610,17 +655,17 @@ class ThreadedServer(CommonServer):
 class GeventServer(CommonServer):
     def __init__(self, app):
         super(GeventServer, self).__init__(app)
-        self.port = config['longpolling_port']
+        self.port = config['gevent_port']
         self.httpd = None
 
     def process_limits(self):
         restart = False
         if self.ppid != os.getppid():
-            _logger.warning("LongPolling Parent changed", self.pid)
+            _logger.warning("Gevent Parent changed: %s", self.pid)
             restart = True
         memory = memory_info(psutil.Process(self.pid))
         if config['limit_memory_soft'] and memory > config['limit_memory_soft']:
-            _logger.warning('LongPolling virtual memory limit reached: %s', memory)
+            _logger.warning('Gevent virtual memory limit reached: %s', memory)
             restart = True
         if restart:
             # suicide !!
@@ -647,6 +692,13 @@ class GeventServer(CommonServer):
             Derived from werzeug.serving.WSGIRequestHandler.log
             / werzeug.serving.WSGIRequestHandler.address_string
             """
+            def _connection_upgrade_requested(self):
+                if self.headers.get('Connection', '').lower() == 'upgrade':
+                    return True
+                if self.headers.get('Upgrade', '').lower() == 'websocket':
+                    return True
+                return False
+
             def format_request(self):
                 old_address = self.client_address
                 if getattr(self, 'environ', None):
@@ -658,6 +710,27 @@ class GeventServer(CommonServer):
                     return super().format_request()
                 finally:
                     self.client_address = old_address
+
+            def finalize_headers(self):
+                # We need to make gevent.pywsgi stop dealing with chunks when the connection
+                # Is being upgraded. see https://github.com/gevent/gevent/issues/1712
+                super().finalize_headers()
+                if self.code == 101:
+                    # Switching Protocols. Disable chunked writes.
+                    self.response_use_chunked = False
+
+            def get_environ(self):
+                # Add the TCP socket to environ in order for the websocket
+                # connections to use it.
+                environ = super().get_environ()
+                environ['socket'] = self.socket
+                # Disable support for HTTP chunking on reads which cause
+                # an issue when the connection is being upgraded, see
+                # https://github.com/gevent/gevent/issues/1712
+                if self._connection_upgrade_requested():
+                    environ['wsgi.input'] = self.rfile
+                    environ['wsgi.input_terminated'] = False
+                return environ
 
         set_limit_memory_hard()
         if os.name == 'posix':
@@ -1112,6 +1185,7 @@ class WorkerCron(Worker):
 
     def __init__(self, multi):
         super(WorkerCron, self).__init__(multi)
+        self.alive_time = time.monotonic()
         # process_work() below process a single database per call.
         # The variable db_index is keeping track of the next database to
         # process.
@@ -1134,6 +1208,13 @@ class WorkerCron(Worker):
                 if e.args[0] != errno.EINTR:
                     raise
 
+    def check_limits(self):
+        super().check_limits()
+
+        if config['limit_time_worker_cron'] > 0 and (time.monotonic() - self.alive_time) > config['limit_time_worker_cron']:
+            _logger.info('WorkerCron (%s) max age (%ss) reached.', self.pid, config['limit_time_worker_cron'])
+            self.alive = False
+
     def _db_list(self):
         if config['db_name']:
             db_names = config['db_name'].split(',')
@@ -1142,17 +1223,12 @@ class WorkerCron(Worker):
         return db_names
 
     def process_work(self):
-        rpc_request = logging.getLogger('odoo.netsvc.rpc.request')
-        rpc_request_flag = rpc_request.isEnabledFor(logging.DEBUG)
         _logger.debug("WorkerCron (%s) polling for jobs", self.pid)
         db_names = self._db_list()
         if len(db_names):
             self.db_index = (self.db_index + 1) % len(db_names)
             db_name = db_names[self.db_index]
             self.setproctitle(db_name)
-            if rpc_request_flag:
-                start_time = time.time()
-                start_memory = memory_info(psutil.Process(os.getpid()))
 
             from odoo.addons import base
             base.models.ir_cron.ir_cron._process_jobs(db_name)
@@ -1160,13 +1236,6 @@ class WorkerCron(Worker):
             # dont keep cursors in multi database mode
             if len(db_names) > 1:
                 odoo.sql_db.close_db(db_name)
-            if rpc_request_flag:
-                run_time = time.time() - start_time
-                end_memory = memory_info(psutil.Process(os.getpid()))
-                vms_diff = (end_memory - start_memory) / 1024
-                logline = '%s time:%.3fs mem: %sk -> %sk (diff: %sk)' % \
-                    (db_name, run_time, start_memory / 1024, end_memory / 1024, vms_diff)
-                _logger.debug("WorkerCron (%s) %s", self.pid, logline)
 
             self.request_count += 1
             if self.request_count >= self.request_max and self.request_max < len(db_names):
@@ -1195,6 +1264,7 @@ class WorkerCron(Worker):
 
     def stop(self):
         super().stop()
+        self.dbcursor._cnx.close()
         self.dbcursor.close()
 
 #----------------------------------------------------------
@@ -1204,7 +1274,8 @@ class WorkerCron(Worker):
 server = None
 
 def load_server_wide_modules():
-    server_wide_modules = {'base', 'web'} | set(odoo.conf.server_wide_modules)
+    server_wide_modules = list(odoo.conf.server_wide_modules)
+    server_wide_modules.extend(m for m in ('base', 'web') if m not in server_wide_modules)
     for m in server_wide_modules:
         try:
             odoo.modules.module.load_openerp_module(m)
@@ -1230,11 +1301,12 @@ def _reexec(updated_modules=None):
     os.execve(sys.executable, args, os.environ)
 
 def load_test_file_py(registry, test_file):
-    from odoo.tests.common import OdooSuite
+    # pylint: disable=import-outside-toplevel
+    from odoo.tests.suite import OdooSuite
     threading.current_thread().testing = True
     try:
         test_path, _ = os.path.splitext(os.path.abspath(test_file))
-        for mod in [m for m in get_modules() if '/%s/' % m in test_file]:
+        for mod in [m for m in get_modules() if '%s%s%s' % (os.path.sep, m, os.path.sep) in test_file]:
             for mod_mod in loader.get_test_modules(mod):
                 mod_path, _ = os.path.splitext(getattr(mod_mod, '__file__', ''))
                 if test_path == config._normalize(mod_path):
@@ -1257,6 +1329,7 @@ def preload_registries(dbnames):
     for dbname in dbnames:
         try:
             update_module = config['init'] or config['update']
+            threading.current_thread().dbname = dbname
             registry = Registry.new(dbname, update_module=update_module)
 
             # run test_file if provided
@@ -1278,13 +1351,19 @@ def preload_registries(dbnames):
                                 sorted(registry._init_modules))
                 _logger.info("Starting post tests")
                 tests_before = registry._assertion_report.testsRun
-                result = loader.run_suite(loader.make_suite(module_names, 'post_install'))
+                post_install_suite = loader.make_suite(module_names, 'post_install')
+                if post_install_suite.has_http_case():
+                    with registry.cursor() as cr:
+                        env = odoo.api.Environment(cr, odoo.SUPERUSER_ID, {})
+                        env['ir.qweb']._pregenerate_assets_bundles()
+                result = loader.run_suite(post_install_suite, global_report=registry._assertion_report)
                 registry._assertion_report.update(result)
                 _logger.info("%d post-tests in %.2fs, %s queries",
                              registry._assertion_report.testsRun - tests_before,
                              time.time() - t0,
                              odoo.sql_db.sql_counter - t0_sql)
 
+                registry._assertion_report.log_stats()
             if not registry._assertion_report.wasSuccessful():
                 rc += 1
         except Exception:
@@ -1300,12 +1379,12 @@ def start(preload=None, stop=False):
     load_server_wide_modules()
 
     if odoo.evented:
-        server = GeventServer(odoo.service.wsgi_server.application)
+        server = GeventServer(odoo.http.root)
     elif config['workers']:
         if config['test_enable'] or config['test_file']:
             _logger.warning("Unit testing in workers mode could fail; use --workers 0.")
 
-        server = PreforkServer(odoo.service.wsgi_server.application)
+        server = PreforkServer(odoo.http.root)
 
         # Workaround for Python issue24291, fixed in 3.6 (see Python issue26721)
         if sys.version_info[:2] == (3,5):
@@ -1334,7 +1413,7 @@ def start(preload=None, stop=False):
                 assert libc.mallopt(ctypes.c_int(M_ARENA_MAX), ctypes.c_int(2))
             except Exception:
                 _logger.warning("Could not set ARENA_MAX through mallopt()")
-        server = ThreadedServer(odoo.service.wsgi_server.application)
+        server = ThreadedServer(odoo.http.root)
 
     watcher = None
     if 'reload' in config['dev_mode'] and not odoo.evented:
@@ -1350,8 +1429,6 @@ def start(preload=None, stop=False):
             else:
                 module = 'watchdog'
             _logger.warning("'%s' module not installed. Code autoreload feature is disabled", module)
-    if 'werkzeug' in config['dev_mode']:
-        server.app = DebuggedApplication(server.app, evalex=True)
 
     rc = server.run(preload, stop)
 

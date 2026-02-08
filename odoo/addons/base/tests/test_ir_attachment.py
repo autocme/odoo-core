@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 import base64
-import binascii
 import hashlib
 import io
 import os
 
 from PIL import Image
 
+import odoo
 from odoo.exceptions import AccessError
 from odoo.addons.base.tests.common import TransactionCaseWithUserDemo
 from odoo.tools import image_to_base64
@@ -234,6 +234,34 @@ class TestIrAttachment(TransactionCaseWithUserDemo):
         self.assertEqual(document3.store_fname, self.blob1_fname)
         self.assertEqual(document3.checksum, self.blob1_hash)
 
+    def test_12_gc(self):
+        # the data needs to be unique so that no other attachment link
+        # the file so that the gc removes it
+        unique_blob = os.urandom(16)
+        a1 = self.Attachment.create({'name': 'a1', 'raw': unique_blob})
+        store_path = os.path.join(self.filestore, a1.store_fname)
+        self.assertTrue(os.path.isfile(store_path), 'file exists')
+        a1.unlink()
+        self.Attachment._gc_file_store_unsafe()
+        self.assertFalse(os.path.isfile(store_path), 'file removed')
+
+    def test_13_rollback(self):
+        self.registry.enter_test_mode(self.cr)
+        self.addCleanup(self.registry.leave_test_mode)
+        self.cr = self.registry.cursor()
+        self.addCleanup(self.cr.close)
+        self.env = odoo.api.Environment(self.cr, odoo.SUPERUSER_ID, {})
+
+        # the data needs to be unique so that no other attachment link
+        # the file so that the gc removes it
+        unique_blob = os.urandom(16)
+        a1 = self.Attachment.create({'name': 'a1', 'raw': unique_blob})
+        store_path = os.path.join(self.filestore, a1.store_fname)
+        self.assertTrue(os.path.isfile(store_path), 'file exists')
+        self.env.cr.rollback()
+        self.Attachment._gc_file_store_unsafe()
+        self.assertFalse(os.path.isfile(store_path), 'file removed')
+
 
 class TestPermissions(TransactionCaseWithUserDemo):
     def setUp(self):
@@ -255,8 +283,8 @@ class TestPermissions(TransactionCaseWithUserDemo):
             'domain_force': "[('id', '!=', %s)]" % record.id,
             'perm_read': False
         })
-        a.flush()
-        a.invalidate_cache(ids=a.ids)
+        self.env.flush_all()
+        a.invalidate_recordset()
 
     def test_no_read_permission(self):
         """If the record can't be read, the attachment can't be read either
@@ -265,7 +293,7 @@ class TestPermissions(TransactionCaseWithUserDemo):
         self.attachment.datas
         # prevent read access on record
         self.rule.perm_read = True
-        self.attachment.invalidate_cache(ids=self.attachment.ids)
+        self.attachment.invalidate_recordset()
         with self.assertRaises(AccessError):
             self.attachment.datas
 

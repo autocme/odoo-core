@@ -1,13 +1,13 @@
 import astroid
+import contextlib
 from pylint import checkers, interfaces
 
 
 class OdooBaseChecker(checkers.BaseChecker):
-    try: # TODO, remove once pylint minimal version is 3.0.0
+    with contextlib.suppress(AttributeError):  # TODO, TODO, remove once pylint minimal version is 3.0.0
         __implements__ = interfaces.IAstroidChecker
         # see https://github.com/pylint-dev/pylint/commit/358264aaf622505f6d2e8bc699618382981a078c
-    except AttributeError:
-        pass
+
     name = 'odoo'
 
     msgs = {

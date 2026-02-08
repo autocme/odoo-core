@@ -10,6 +10,7 @@ import re
 from odoo import api, fields, models, tools, _, Command
 from odoo.exceptions import ValidationError, UserError
 from odoo.modules.module import get_resource_path
+from odoo.tools import html2plaintext
 from random import randrange
 from PIL import Image
 
@@ -57,6 +58,7 @@ class Company(models.Model):
             return base64.b64encode(stream.getvalue())
 
     name = fields.Char(related='partner_id.name', string='Company Name', required=True, store=True, readonly=False)
+    active = fields.Boolean(default=True)
     sequence = fields.Integer(help='Used to order Companies in the company switcher', default=10)
     parent_id = fields.Many2one('res.company', string='Parent Company', index=True)
     child_ids = fields.One2many('res.company', 'parent_id', string='Child Companies')
@@ -64,6 +66,7 @@ class Company(models.Model):
     report_header = fields.Html(string='Company Tagline', help="Appears by default on the top right corner of your printed documents (report header).")
     report_footer = fields.Html(string='Report Footer', translate=True, help="Footer text displayed at the bottom of all reports.")
     company_details = fields.Html(string='Company Details', help="Header text displayed at the top of all reports.")
+    is_company_details_empty = fields.Boolean(compute='_compute_empty_company_details')
     logo = fields.Binary(related='partner_id.image_1920', default=_get_logo, string="Company Logo", readonly=False)
     # logo_web: do not store in attachments, since the image is retrieved in SQL for
     # performance reasons (see addons/web/controllers/main.py, Binary.company_logo)
@@ -85,13 +88,13 @@ class Company(models.Model):
     mobile = fields.Char(related='partner_id.mobile', store=True, readonly=False)
     website = fields.Char(related='partner_id.website', readonly=False)
     vat = fields.Char(related='partner_id.vat', string="Tax ID", readonly=False)
-    company_registry = fields.Char(compute='_compute_company_registry', store=True, readonly=False)
+    company_registry = fields.Char(related='partner_id.company_registry', string="Company ID", readonly=False)
     paperformat_id = fields.Many2one('report.paperformat', 'Paper format', default=lambda self: self.env.ref('base.paperformat_euro', raise_if_not_found=False))
     external_report_layout_id = fields.Many2one('ir.ui.view', 'Document Template')
     base_onboarding_company_state = fields.Selection([
         ('not_done', "Not done"), ('just_done', "Just done"), ('done', "Done")], string="State of the onboarding company step", default='not_done')
     favicon = fields.Binary(string="Company Favicon", help="This field holds the image used to display a favicon for a given company.", default=_get_default_favicon)
-    font = fields.Selection([("Lato", "Lato"), ("Roboto", "Roboto"), ("Open_Sans", "Open Sans"), ("Montserrat", "Montserrat"), ("Oswald", "Oswald"), ("Raleway", "Raleway")], default="Lato")
+    font = fields.Selection([("Lato", "Lato"), ("Roboto", "Roboto"), ("Open_Sans", "Open Sans"), ("Montserrat", "Montserrat"), ("Oswald", "Oswald"), ("Raleway", "Raleway"), ('Tajawal', 'Tajawal')], default="Lato")
     primary_color = fields.Char()
     secondary_color = fields.Char()
     layout_background = fields.Selection([('Blank', 'Blank'), ('Geometric', 'Geometric'), ('Custom', 'Custom')], default="Blank", required=True)
@@ -117,11 +120,6 @@ class Company(models.Model):
     def _get_company_address_update(self, partner):
         return dict((fname, partner[fname])
                     for fname in self._get_company_address_field_names())
-
-    def _compute_company_registry(self):
-        # exists to allow overrides
-        for company in self:
-            company.company_registry = company.company_registry
     
     # TODO @api.depends(): currently now way to formulate the dependency on the
     # partner's contact address
@@ -159,7 +157,8 @@ class Company(models.Model):
     @api.depends('partner_id.image_1920')
     def _compute_logo_web(self):
         for company in self:
-            company.logo_web = tools.image_process(company.partner_id.image_1920, size=(180, 0))
+            img = company.partner_id.image_1920
+            company.logo_web = img and base64.b64encode(tools.image_process(base64.b64decode(img), size=(180, 0)))
 
     @api.onchange('state_id')
     def _onchange_state(self):
@@ -194,41 +193,62 @@ class Company(models.Model):
         _logger.warning("The method '_company_default_get' on res.company is deprecated and shouldn't be used anymore")
         return self.env.company
 
+    @api.depends('company_details')
+    def _compute_empty_company_details(self):
+        # In recent change when an html field is empty a <p> balise remains with a <br> in it,
+        # but when company details is empty we want to put the info of the company
+        for record in self:
+            record.is_company_details_empty = not html2plaintext(record.company_details or '')
+
     # deprecated, use clear_caches() instead
     def cache_restart(self):
         self.clear_caches()
 
-    @api.model
-    def create(self, vals):
-        if not vals.get('favicon'):
-            vals['favicon'] = self._get_default_favicon()
-        if not vals.get('name') or vals.get('partner_id'):
-            self.clear_caches()
-            return super(Company, self).create(vals)
-        partner = self.env['res.partner'].create({
-            'name': vals['name'],
-            'is_company': True,
-            'image_1920': vals.get('logo'),
-            'email': vals.get('email'),
-            'phone': vals.get('phone'),
-            'website': vals.get('website'),
-            'vat': vals.get('vat'),
-            'country_id': vals.get('country_id'),
-        })
-        # compute stored fields, for example address dependent fields
-        partner.flush()
-        vals['partner_id'] = partner.id
-        self.clear_caches()
-        company = super(Company, self).create(vals)
-        # The write is made on the user to set it automatically in the multi company group.
-        self.env.user.write({'company_ids': [Command.link(company.id)]})
+    @api.model_create_multi
+    def create(self, vals_list):
+        # add default favicon
+        for vals in vals_list:
+            if not vals.get('favicon'):
+                vals['favicon'] = self._get_default_favicon()
 
-        # Make sure that the selected currency is enabled
-        if vals.get('currency_id'):
-            currency = self.env['res.currency'].browse(vals['currency_id'])
-            if not currency.active:
-                currency.write({'active': True})
-        return company
+        # create missing partners
+        no_partner_vals_list = [
+            vals
+            for vals in vals_list
+            if vals.get('name') and not vals.get('partner_id')
+        ]
+        if no_partner_vals_list:
+            partners = self.env['res.partner'].create([
+                {
+                    'name': vals['name'],
+                    'is_company': True,
+                    'image_1920': vals.get('logo'),
+                    'email': vals.get('email'),
+                    'phone': vals.get('phone'),
+                    'website': vals.get('website'),
+                    'vat': vals.get('vat'),
+                    'country_id': vals.get('country_id'),
+                }
+                for vals in no_partner_vals_list
+            ])
+            # compute stored fields, for example address dependent fields
+            partners.flush_model()
+            for vals, partner in zip(no_partner_vals_list, partners):
+                vals['partner_id'] = partner.id
+
+        self.clear_caches()
+        companies = super().create(vals_list)
+
+        # The write is made on the user to set it automatically in the multi company group.
+        if companies:
+            self.env.user.write({
+                'company_ids': [Command.link(company.id) for company in companies],
+            })
+
+        # Make sure that the selected currencies are enabled
+        companies.currency_id.sudo().filtered(lambda c: not c.active).active = True
+
+        return companies
 
     def write(self, values):
         self.clear_caches()
@@ -244,8 +264,25 @@ class Company(models.Model):
         company_address_fields = self._get_company_address_field_names()
         company_address_fields_upd = set(company_address_fields) & set(values.keys())
         if company_address_fields_upd:
-            self.invalidate_cache(fnames=company_address_fields)
+            self.invalidate_model(company_address_fields)
         return res
+
+    @api.constrains('active')
+    def _check_active(self):
+        for company in self:
+            if not company.active:
+                company_active_users = self.env['res.users'].search_count([
+                    ('company_id', '=', company.id),
+                    ('active', '=', True),
+                ])
+                if company_active_users:
+                    # You cannot disable companies with active users
+                    raise ValidationError(_(
+                        'The company %(company_name)s cannot be archived because it is still used '
+                        'as the default company of %(active_users)s users.',
+                        company_name=company.name,
+                        active_users=company_active_users,
+                    ))
 
     @api.constrains('parent_id')
     def _check_parent_id(self):
@@ -277,7 +314,7 @@ class Company(models.Model):
         if self[step_name] == 'not_done':
             self[step_name] = 'just_done'
 
-    def get_and_update_onbarding_state(self, onboarding_state, steps_states):
+    def _get_and_update_onboarding_state(self, onboarding_state, steps_states):
         """ Needed to display onboarding animations only one time. """
         old_values = {}
         all_done = True

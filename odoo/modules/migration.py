@@ -27,18 +27,21 @@ def load_script(path, module_name):
 
 
 class MigrationManager(object):
-    """
-        This class manage the migration of modules
-        Migrations files must be python files containing a `migrate(cr, installed_version)`
+    """ Manages the migration of modules.
+
+        Migrations files must be python files containing a ``migrate(cr, installed_version)``
         function. These files must respect a directory tree structure: A 'migrations' folder
         which contains a folder by version. Version can be 'module' version or 'server.module'
         version (in this case, the files will only be processed by this version of the server).
-        Python file names must start by `pre-` or `post-` and will be executed, respectively,
-        before and after the module initialisation. `end-` scripts are run after all modules have
+        Python file names must start by ``pre-`` or ``post-`` and will be executed, respectively,
+        before and after the module initialisation. ``end-`` scripts are run after all modules have
         been updated.
-        A special folder named `0.0.0` can contain scripts that will be run on any version change.
-        In `pre` stage, `0.0.0` scripts are run first, while in `post` and `end`, they are run last.
-        Example:
+
+        A special folder named ``0.0.0`` can contain scripts that will be run on any version change.
+        In `pre` stage, ``0.0.0`` scripts are run first, while in ``post`` and ``end``, they are run last.
+
+        Example::
+
             <moduledir>
             `-- migrations
                 |-- 1.0
@@ -112,7 +115,7 @@ class MigrationManager(object):
 
         def _get_migration_versions(pkg, stage):
             versions = sorted({
-                ver
+                ver: None
                 for lv in self.migrations[pkg.name].values()
                 for ver, lf in lv.items()
                 if lf
@@ -163,27 +166,26 @@ class MigrationManager(object):
         versions = _get_migration_versions(pkg, stage)
         for version in versions:
             if compare(version):
-                strfmt = {'addon': pkg.name,
-                          'stage': stage,
-                          'version': stageformat[stage] % version,
-                          }
-
                 for pyfile in _get_migration_files(pkg, version, stage):
-                    name, ext = os.path.splitext(os.path.basename(pyfile))
-                    if ext.lower() != '.py':
-                        continue
-                    mod = None
-                    try:
-                        mod = load_script(pyfile, name)
-                        _logger.info('module %(addon)s: Running migration %(version)s %(name)s' % dict(strfmt, name=mod.__name__))
-                        migrate = mod.migrate
-                    except ImportError:
-                        _logger.exception('module %(addon)s: Unable to load %(stage)s-migration file %(file)s' % dict(strfmt, file=pyfile))
-                        raise
-                    except AttributeError:
-                        _logger.error('module %(addon)s: Each %(stage)s-migration file must have a "migrate(cr, installed_version)" function' % strfmt)
-                    else:
-                        migrate(self.cr, installed_version)
-                    finally:
-                        if mod:
-                            del mod
+                    exec_script(self.cr, installed_version, pyfile, pkg.name, stage, stageformat[stage] % version)
+
+def exec_script(cr, installed_version, pyfile, addon, stage, version=None):
+    version = version or installed_version
+    name, ext = os.path.splitext(os.path.basename(pyfile))
+    if ext.lower() != '.py':
+        return
+    mod = None
+    try:
+        mod = load_script(pyfile, name)
+        _logger.info('module %(addon)s: Running migration %(version)s %(name)s' % dict(locals(), name=mod.__name__))
+        migrate = mod.migrate
+    except ImportError:
+        _logger.exception('module %(addon)s: Unable to load %(stage)s-migration file %(file)s' % dict(locals(), file=pyfile))
+        raise
+    except AttributeError:
+        _logger.error('module %(addon)s: Each %(stage)s-migration file must have a "migrate(cr, installed_version)" function' % locals())
+    else:
+        migrate(cr, installed_version)
+    finally:
+        if mod:
+            del mod

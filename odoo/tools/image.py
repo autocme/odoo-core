@@ -53,33 +53,34 @@ IMAGE_MAX_RESOLUTION = 50e6
 
 class ImageProcess():
 
-    def __init__(self, base64_source, verify_resolution=True):
-        """Initialize the `base64_source` image for processing.
+    def __init__(self, source, verify_resolution=True):
+        """Initialize the `source` image for processing.
 
-        :param base64_source: the original image base64 encoded
-            No processing will be done if the `base64_source` is falsy or if
+        :param source: the original image binary
+
+            No processing will be done if the `source` is falsy or if
             the image is SVG.
-        :type base64_source: string or bytes
 
         :param verify_resolution: if True, make sure the original image size is not
             excessive before starting to process it. The max allowed resolution is
             defined by `IMAGE_MAX_RESOLUTION`.
         :type verify_resolution: bool
-
-        :return: self
         :rtype: ImageProcess
 
         :raise: ValueError if `verify_resolution` is True and the image is too large
-        :raise: UserError if the base64 is incorrect or the image can't be identified by PIL
+        :raise: UserError if the image can't be identified by PIL
         """
-        self.base64_source = base64_source or False
+        self.source = source or False
         self.operationsCount = 0
 
-        if not base64_source or base64_source[:1] in (b'P', 'P'):
+        if not source or source[:1] == b'<':
             # don't process empty source or SVG
             self.image = False
         else:
-            self.image = base64_to_image(self.base64_source)
+            try:
+                self.image = Image.open(io.BytesIO(source))
+            except (OSError, binascii.Error):
+                raise UserError(_("This file could not be decoded as an image file."))
 
             # Original format has to be saved before fixing the orientation or
             # doing any other operations because the information will be lost on
@@ -90,7 +91,7 @@ class ImageProcess():
 
             w, h = self.image.size
             if verify_resolution and w * h > IMAGE_MAX_RESOLUTION:
-                raise UserError(_("Image size excessive, uploaded images must be smaller than %s million pixels.", str(IMAGE_MAX_RESOLUTION / 1e6)))
+                raise UserError(_("Too large image (above %sMpx), reduce the image size.", str(IMAGE_MAX_RESOLUTION / 1e6)))
 
     def image_quality(self, quality=0, output_format=''):
         """Return the image resulting of all the image processing
@@ -103,24 +104,21 @@ class ImageProcess():
         and the `output_format` is the same as the original format and the
         quality is not specified.
 
-        :param quality: quality setting to apply. Default to 0.
+        :param int quality: quality setting to apply. Default to 0.
+
             - for JPEG: 1 is worse, 95 is best. Values above 95 should be
-                avoided. Falsy values will fallback to 95, but only if the image
-                was changed, otherwise the original image is returned.
+              avoided. Falsy values will fallback to 95, but only if the image
+              was changed, otherwise the original image is returned.
             - for PNG: set falsy to prevent conversion to a WEB palette.
             - for other formats: no effect.
-        :type quality: int
-
-        :param output_format: the output format. Can be PNG, JPEG, GIF, or ICO.
+        :param str output_format: the output format. Can be PNG, JPEG, GIF, or ICO.
             Default to the format of the original image. BMP is converted to
             PNG, other formats than those mentioned above are converted to JPEG.
-        :type output_format: string
-
         :return: image
         :rtype: bytes or False
         """
         if not self.image:
-            return self.image
+            return self.source
 
         output_image = self.image
 
@@ -131,9 +129,9 @@ class ImageProcess():
             output_format = 'JPEG'
 
         if not self.operationsCount and output_format == self.original_format and not quality:
-            return self.image
+            return self.source
 
-        opt = {'format': output_format}
+        opt = {'output_format': output_format}
 
         if output_format == 'PNG':
             opt['optimize'] = True
@@ -153,44 +151,6 @@ class ImageProcess():
 
         return image_apply_opt(output_image, **opt)
 
-    # TODO: rename to image_quality_base64 in master~saas-15.1
-    def image_base64(self, quality=0, output_format=''):
-        """Return the base64 encoded image resulting of all the image processing
-        operations that have been applied previously.
-
-        Return False if the initialized `base64_source` was falsy, and return
-        the initialized `base64_source` without change if it was SVG.
-
-        Also return the initialized `base64_source` if no operations have been
-        applied and the `output_format` is the same as the original format and
-        the quality is not specified.
-
-        :param quality: quality setting to apply. Default to 0.
-            - for JPEG: 1 is worse, 95 is best. Values above 95 should be
-                avoided. Falsy values will fallback to 95, but only if the image
-                was changed, otherwise the original image is returned.
-            - for PNG: set falsy to prevent conversion to a WEB palette.
-            - for other formats: no effect.
-        :type quality: int
-
-        :param output_format: the output format. Can be PNG, JPEG, GIF, or ICO.
-            Default to the format of the original image. BMP is converted to
-            PNG, other formats than those mentioned above are converted to JPEG.
-        :type output_format: string
-
-        :return: image base64 encoded or False
-        :rtype: bytes or False
-        """
-
-        if not self.image:
-            return self.base64_source
-
-        stream = self.image_quality(quality=quality, output_format=output_format)
-
-        if stream != self.image:
-            return base64.b64encode(stream)
-        return self.base64_source
-
     def resize(self, max_width=0, max_height=0):
         """Resize the image.
 
@@ -205,12 +165,8 @@ class ImageProcess():
         It is currently not supported for GIF because we do not handle all the
         frames properly.
 
-        :param max_width: max width
-        :type max_width: int
-
-        :param max_height: max height
-        :type max_height: int
-
+        :param int max_width: max width
+        :param int max_height: max height
         :return: self to allow chaining
         :rtype: ImageProcess
         """
@@ -243,20 +199,12 @@ class ImageProcess():
         It is currently not supported for GIF because we do not handle all the
         frames properly.
 
-        :param max_width: max width
-        :type max_width: int
-
-        :param max_height: max height
-        :type max_height: int
-
-        :param center_x: the center of the crop between 0 (left) and 1 (right)
-            Default to 0.5 (center).
-        :type center_x: float
-
-        :param center_y: the center of the crop between 0 (top) and 1 (bottom)
-            Default to 0.5 (center).
-        :type center_y: float
-
+        :param int max_width: max width
+        :param int max_height: max height
+        :param float center_x: the center of the crop between 0 (left) and 1
+            (right). Defaults to 0.5 (center).
+        :param float center_y: the center of the crop between 0 (top) and 1
+            (bottom). Defaults to 0.5 (center).
         :return: self to allow chaining
         :rtype: ImageProcess
         """
@@ -307,16 +255,16 @@ class ImageProcess():
         return self
 
 
-def image_process(base64_source, size=(0, 0), verify_resolution=False, quality=0, crop=None, colorize=False, output_format=''):
-    """Process the `base64_source` image by executing the given operations and
-    return the result as a base64 encoded image.
+def image_process(source, size=(0, 0), verify_resolution=False, quality=0, crop=None, colorize=False, output_format=''):
+    """Process the `source` image by executing the given operations and
+    return the result image.
     """
-    if not base64_source or ((not size or (not size[0] and not size[1])) and not verify_resolution and not quality and not crop and not colorize and not output_format):
+    if not source or ((not size or (not size[0] and not size[1])) and not verify_resolution and not quality and not crop and not colorize and not output_format):
         # for performance: don't do anything if the image is falsy or if
         # no operations have been requested
-        return base64_source
+        return source
 
-    image = ImageProcess(base64_source, verify_resolution)
+    image = ImageProcess(source, verify_resolution)
     if size:
         if crop:
             center_x = 0.5
@@ -330,7 +278,7 @@ def image_process(base64_source, size=(0, 0), verify_resolution=False, quality=0
             image.resize(max_width=size[0], max_height=size[1])
     if colorize:
         image.colorize()
-    return image.image_base64(quality=quality, output_format=output_format)
+    return image.image_quality(quality=quality, output_format=output_format)
 
 
 # ----------------------------------------
@@ -340,25 +288,30 @@ def image_process(base64_source, size=(0, 0), verify_resolution=False, quality=0
 def average_dominant_color(colors, mitigate=175, max_margin=140):
     """This function is used to calculate the dominant colors when given a list of colors
 
-    There are 5 steps :
-        1) Select dominant colors (highest count), isolate its values and remove
-           it from the current color set.
-        2) Set margins according to the prevalence of the dominant color.
-        3) Evaluate the colors. Similar colors are grouped in the dominant set
-           while others are put in the "remaining" list.
-        4) Calculate the average color for the dominant set. This is done by
-           averaging each band and joining them into a tuple.
-        5) Mitigate final average and convert it to hex
+    There are 5 steps:
+
+    1) Select dominant colors (highest count), isolate its values and remove
+       it from the current color set.
+    2) Set margins according to the prevalence of the dominant color.
+    3) Evaluate the colors. Similar colors are grouped in the dominant set
+       while others are put in the "remaining" list.
+    4) Calculate the average color for the dominant set. This is done by
+       averaging each band and joining them into a tuple.
+    5) Mitigate final average and convert it to hex
 
     :param colors: list of tuples having:
-        [0] color count in the image
-        [1] actual color: tuple(R, G, B, A)
-        -> these can be extracted from a PIL image using image.getcolors()
+
+        0. color count in the image
+        1. actual color: tuple(R, G, B, A)
+
+        -> these can be extracted from a PIL image using
+        :meth:`~PIL.Image.Image.getcolors`
     :param mitigate: maximum value a band can reach
     :param max_margin: maximum difference from one of the dominant values
     :returns: a tuple with two items:
-        [0] the average color of the dominant set as: tuple(R, G, B)
-        [1] list of remaining colors, used to evaluate subsequent dominant colors
+
+        0. the average color of the dominant set as: tuple(R, G, B)
+        1. list of remaining colors, used to evaluate subsequent dominant colors
     """
     dominant_color = max(colors)
     dominant_rgb = dominant_color[1][:3]
@@ -417,11 +370,10 @@ def image_fix_orientation(image):
     save the complexity of removing it.
 
     :param image: the source image
-    :type image: PIL.Image
-
+    :type image: ~PIL.Image.Image
     :return: the resulting image, copy of the source, with orientation fixed
         or the source image if no operation was applied
-    :rtype: PIL.Image
+    :rtype: ~PIL.Image.Image
     """
     getexif = getattr(image, 'getexif', None) or getattr(image, '_getexif', None)  # support PIL < 6.0
     if getexif:
@@ -434,55 +386,54 @@ def image_fix_orientation(image):
     return image
 
 
+def binary_to_image(source):
+    try:
+        return Image.open(io.BytesIO(source))
+    except (OSError, binascii.Error):
+        raise UserError(_("This file could not be decoded as an image file."))
+
 def base64_to_image(base64_source):
     """Return a PIL image from the given `base64_source`.
 
     :param base64_source: the image base64 encoded
     :type base64_source: string or bytes
-
-    :return: the PIL image
-    :rtype: PIL.Image
-
+    :rtype: ~PIL.Image.Image
     :raise: UserError if the base64 is incorrect or the image can't be identified by PIL
     """
     try:
         return Image.open(io.BytesIO(base64.b64decode(base64_source)))
     except (OSError, binascii.Error):
-        raise UserError(_("This file could not be decoded as an image file. Please try with a different file."))
+        raise UserError(_("This file could not be decoded as an image file."))
 
 
-def image_apply_opt(image, format, **params):
+def image_apply_opt(image, output_format, **params):
     """Return the given PIL `image` using `params`.
 
-    :param image: the PIL image
-    :type image: PIL.Image
-
-    :param params: params to expand when calling PIL.Image.save()
-    :type params: dict
-
+    :type image: ~PIL.Image.Image
+    :param str output_format: :meth:`~PIL.Image.Image.save`'s ``format`` parameter
+    :param dict params: params to expand when calling :meth:`~PIL.Image.Image.save`
     :return: the image formatted
     :rtype: bytes
     """
-    if format == 'JPEG' and image.mode not in ['1', 'L', 'RGB']:
+    if output_format == 'JPEG' and image.mode not in ['1', 'L', 'RGB']:
         image = image.convert("RGB")
     stream = io.BytesIO()
-    image.save(stream, format=format, **params)
+    image.save(stream, format=output_format, **params)
     return stream.getvalue()
 
-def image_to_base64(image, format, **params):
+
+def image_to_base64(image, output_format, **params):
     """Return a base64_image from the given PIL `image` using `params`.
 
-    :param image: the PIL image
-    :type image: PIL.Image
-
-    :param params: params to expand when calling PIL.Image.save()
-    :type params: dict
-
+    :type image: ~PIL.Image.Image
+    :param str output_format:
+    :param dict params: params to expand when calling :meth:`~PIL.Image.Image.save`
     :return: the image base64 encoded
     :rtype: bytes
     """
-    stream = image_apply_opt(image, format, **params)
+    stream = image_apply_opt(image, output_format, **params)
     return base64.b64encode(stream)
+
 
 def is_image_size_above(base64_source_1, base64_source_2):
     """Return whether or not the size of the given image `base64_source_1` is
@@ -563,13 +514,3 @@ def hex_to_rgb(hx):
 def rgb_to_hex(rgb):
     """Converts a RGB tuple or list to an hexadecimal string"""
     return '#' + ''.join([(hex(c).split('x')[-1].zfill(2)) for c in rgb])
-
-
-if __name__=="__main__":
-    import sys
-
-    assert len(sys.argv)==3, 'Usage to Test: image.py SRC.png DEST.png'
-
-    img = base64.b64encode(open(sys.argv[1],'rb').read())
-    new = image_process(img, size=(128, 100))
-    open(sys.argv[2], 'wb').write(base64.b64decode(new))

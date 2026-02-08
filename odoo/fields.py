@@ -5,23 +5,32 @@
 
 from collections import defaultdict
 from datetime import date, datetime, time
+from lxml import etree, html
 from operator import attrgetter
 from xmlrpc.client import MAXINT
+import ast
 import base64
+import copy
 import binascii
 import enum
 import itertools
+import json
 import logging
+import uuid
 import warnings
 
 from markupsafe import Markup
 import psycopg2
+from psycopg2.extras import Json as PsycopgJson
 import pytz
+from difflib import get_close_matches
+from hashlib import sha256
 
 from .tools import (
-    float_repr, float_round, float_compare, float_is_zero, html_sanitize, human_size,
-    pg_varchar, ustr, OrderedSet, pycompat, sql, date_utils, unique, IterableGenerator,
-    image_process, merge_sequences,
+    float_repr, float_round, float_compare, float_is_zero, human_size,
+    pg_varchar, ustr, OrderedSet, pycompat, sql, date_utils, unique,
+    image_process, merge_sequences, SQL_ORDER_BY_TYPE, is_list_of, has_list_types,
+    html_normalize, html_sanitize,
 )
 from .tools import DEFAULT_SERVER_DATE_FORMAT as DATE_FORMAT
 from .tools import DEFAULT_SERVER_DATETIME_FORMAT as DATETIME_FORMAT
@@ -30,6 +39,7 @@ from .tools.mimetypes import guess_mimetype
 
 from odoo import SUPERUSER_ID
 from odoo.exceptions import CacheMiss
+from odoo.osv import expression
 
 DATE_LENGTH = len(date.today().strftime(DATE_FORMAT))
 DATETIME_LENGTH = len(datetime.now().strftime(DATETIME_FORMAT))
@@ -45,6 +55,7 @@ IR_MODELS = (
 _logger = logging.getLogger(__name__)
 _schema = logging.getLogger(__name__[:-7] + '.schema')
 
+NoneType = type(None)
 Default = object()                      # default value for __init__() methods
 
 
@@ -59,14 +70,13 @@ def resolve_mro(model, name, predicate):
         classes are ignored.
     """
     result = []
-    for cls in type(model).mro():
-        if not is_registry_class(cls):
-            value = cls.__dict__.get(name, Default)
-            if value is Default:
-                continue
-            if not predicate(value):
-                break
-            result.append(value)
+    for cls in model._model_classes__:
+        value = cls.__dict__.get(name, Default)
+        if value is Default:
+            continue
+        if not predicate(value):
+            break
+        result.append(value)
     return result
 
 
@@ -137,8 +147,15 @@ class Field(MetaField('DummyField', (object,), {})):
 
     :param bool required: whether the value of the field is required (default: ``False``)
 
-    :param bool index: whether the field is indexed in database. Note: no effect
-        on non-stored and virtual fields. (default: ``False``)
+    :param str index: whether the field is indexed in database, and the kind of index.
+        Note: this has no effect on non-stored and virtual fields.
+        The possible values are:
+
+        * ``"btree"`` or ``True``: standard index, good for many2one
+        * ``"btree_not_null"``: BTREE index without NULL values (useful when most
+                                values are NULL, or when NULL is never searched for)
+        * ``"trigram"``: Generalized Inverted Index (GIN) with trigrams (good for full-text search)
+        * ``None`` or ``False``: no index (default)
 
     :param default: the default value for the field; this is either a static
         value, or a function taking a recordset and returning a value; use
@@ -212,6 +229,33 @@ class Field(MetaField('DummyField', (object,), {})):
 
         .. seealso:: :ref:`Advanced Fields/Compute fields <reference/fields/compute>`
 
+    :param bool precompute: whether the field should be computed before record insertion
+        in database.  Should be used to specify manually some fields as precompute=True
+        when the field can be computed before record insertion.
+        (e.g. avoid statistics fields based on search/read_group), many2one
+        linking to the previous record, ... (default: `False`)
+
+        .. warning::
+
+            Precomputation only happens when no explicit value and no default
+            value is provided to create().  This means that a default value
+            disables the precomputation, even if the field is specified as
+            precompute=True.
+
+            Precomputing a field can be counterproductive if the records of the
+            given model are not created in batch.  Consider the situation were
+            many records are created one by one.  If the field is not
+            precomputed, it will normally be computed in batch at the flush(),
+            and the prefetching mechanism will help making the computation
+            efficient.  On the other hand, if the field is precomputed, the
+            computation will be made one by one, and will therefore not be able
+            to take advantage of the prefetching mechanism.
+
+            Following the remark above, precomputed fields can be interesting on
+            the lines of a one2many, which are usually created in batch by the
+            ORM itself, provided that they are created by writing on the record
+            that contains them.
+
     :param bool compute_sudo: whether the field should be recomputed as superuser
         to bypass access rights (by default ``True`` for stored fields, ``False``
         for non stored fields)
@@ -226,6 +270,8 @@ class Field(MetaField('DummyField', (object,), {})):
 
     :param str related: sequence of field names
 
+    :param bool default_export_compatible: whether the field must be exported by default in an import-compatible export
+
         .. seealso:: :ref:`Advanced fields/Related fields <reference/fields/related>`
     """
 
@@ -234,11 +280,9 @@ class Field(MetaField('DummyField', (object,), {})):
     translate = False                   # whether the field is translated
 
     column_type = None                  # database column type (ident, spec)
-    column_format = '%s'                # placeholder for value in queries
-    column_cast_from = ()               # column types that may be cast to this
     write_sequence = 0                  # field ordering for write()
 
-    args = None                         # the parameters given to __init__()
+    _args__ = None                      # the parameters given to __init__()
     _module = None                      # the field's module name
     _modules = None                     # modules that define this field
     _setup_done = True                  # whether the field is completely set up
@@ -257,7 +301,7 @@ class Field(MetaField('DummyField', (object,), {})):
     comodel_name = None                 # name of the model of values (if relational)
 
     store = True                        # whether the field is stored in database
-    index = False                       # whether the field is indexed in database
+    index = None                        # how the field is indexed in database
     manual = False                      # whether the field is a custom field
     copy = True                         # whether the field is copied over by BaseModel.copy()
     _depends = None                     # collection of field dependencies
@@ -265,6 +309,7 @@ class Field(MetaField('DummyField', (object,), {})):
     recursive = False                   # whether self depends on itself
     compute = None                      # compute(recs) computes field on recs
     compute_sudo = False                # whether field should be recomputed as superuser
+    precompute = False                  # whether field has to be computed before creation
     inverse = None                      # inverse(recs) inverses field on recs
     search = None                       # search(recs, operator, value) searches on self
     related = None                      # sequence of field names, for related fields
@@ -279,17 +324,19 @@ class Field(MetaField('DummyField', (object,), {})):
     states = None                       # set readonly and required depending on state
     groups = None                       # csv list of group xml ids
     change_default = False              # whether the field may trigger a "user-onchange"
-    deprecated = None                   # whether the field is deprecated
 
     related_field = None                # corresponding related field
     group_operator = None               # operator for aggregating values
     group_expand = None                 # name of method to expand groups in read_group()
-    prefetch = True                     # whether the field is prefetched
+    prefetch = True                     # the prefetch group (False means no group)
+
+    default_export_compatible = False   # whether the field must be exported by default in an import-compatible export
+    exportable = True
 
     def __init__(self, string=Default, **kwargs):
         kwargs['string'] = string
         self._sequence = next(_global_seq)
-        self.args = {key: val for key, val in kwargs.items() if val is not Default}
+        self.args = self._args__ = {key: val for key, val in kwargs.items() if val is not Default}
 
     def __str__(self):
         if self.name is None:
@@ -308,7 +355,7 @@ class Field(MetaField('DummyField', (object,), {})):
     # The base field setup is done by field.__set_name__(), which determines the
     # field's name, model name, module and its parameters.
     #
-    # The dictionary field.args gives the parameters passed to the field's
+    # The dictionary field._args__ gives the parameters passed to the field's
     # constructor.  Most parameters have an attribute of the same name on the
     # field.  The parameters as attributes are assigned by the field setup.
     #
@@ -318,7 +365,7 @@ class Field(MetaField('DummyField', (object,), {})):
     # are given to the new field as the parameter '_base_fields'; it is a list
     # of fields in override order (or reverse MRO).
     #
-    # In order to save memory, a field should avoid having field.args and/or
+    # In order to save memory, a field should avoid having field._args__ and/or
     # many attributes when possible.  We call "direct" a field that can be set
     # up directly from its definition class.  Direct fields are non-related
     # fields defined on models, and can be shared across registries.  We call
@@ -326,15 +373,15 @@ class Field(MetaField('DummyField', (object,), {})):
     # therefore specific to the registry.
     #
     # Toplevel field are set up once, and are no longer set up from scratch
-    # after that.  Those fields can save memory by discarding field.args and
+    # after that.  Those fields can save memory by discarding field._args__ and
     # field._base_fields once set up, because those are no longer necessary.
     #
     # Non-toplevel non-direct fields are the fields on definition classes that
     # may not be shared.  In other words, those fields are never used directly,
     # and are always recreated as toplevel fields.  On those fields, the base
-    # setup is useless, because only field.args is used for setting up other
+    # setup is useless, because only field._args__ is used for setting up other
     # fields.  We therefore skip the base setup for those fields.  The only
-    # attributes of those fields are: '_sequence', 'args', 'model_name', 'name'
+    # attributes of those fields are: '_sequence', '_args__', 'model_name', 'name'
     # and '_module', which makes their __dict__'s size minimal.
 
     def __set_name__(self, owner, name):
@@ -351,13 +398,13 @@ class Field(MetaField('DummyField', (object,), {})):
             self._module = owner._module
             owner._field_definitions.append(self)
 
-        if not self.args.get('related'):
+        if not self._args__.get('related'):
             self._direct = True
         if self._direct or self._toplevel:
             self._setup_attrs(owner, name)
             if self._toplevel:
-                # free memory, self.args and self._base_fields are no longer useful
-                self.__dict__.pop('args', None)
+                # free memory, self._args__ and self._base_fields are no longer useful
+                self.__dict__.pop('_args__', None)
                 self.__dict__.pop('_base_fields', None)
 
     #
@@ -369,21 +416,21 @@ class Field(MetaField('DummyField', (object,), {})):
         # determine all inherited field attributes
         attrs = {}
         modules = []
-        for field in self.args.get('_base_fields', ()):
+        for field in self._args__.get('_base_fields', ()):
             if not isinstance(self, type(field)):
                 # 'self' overrides 'field' and their types are not compatible;
                 # so we ignore all the parameters collected so far
                 attrs.clear()
                 modules.clear()
                 continue
-            attrs.update(field.args)
+            attrs.update(field._args__)
             if field._module:
                 modules.append(field._module)
-        attrs.update(self.args)
+        attrs.update(self._args__)
         if self._module:
             modules.append(self._module)
 
-        attrs['args'] = self.args
+        attrs['_args__'] = dict(self._args__)
         attrs['model_name'] = model_class._name
         attrs['name'] = name
         attrs['_module'] = modules[-1] if modules else None
@@ -409,6 +456,13 @@ class Field(MetaField('DummyField', (object,), {})):
             attrs['compute_sudo'] = attrs.get('compute_sudo', attrs.get('related_sudo', True))
             attrs['copy'] = attrs.get('copy', False)
             attrs['readonly'] = attrs.get('readonly', True)
+        if attrs.get('precompute'):
+            if not attrs.get('compute') and not attrs.get('related'):
+                warnings.warn(f"precompute attribute doesn't make any sense on non computed field {self}")
+                attrs['precompute'] = False
+            elif not attrs.get('store'):
+                warnings.warn(f"precompute attribute has no impact on non stored field {self}")
+                attrs['precompute'] = False
         if attrs.get('company_dependent'):
             # by default, company-dependent fields are not stored, not computed
             # in superuser mode and not copied
@@ -421,9 +475,6 @@ class Field(MetaField('DummyField', (object,), {})):
                 attrs['inverse'] = self._inverse_company_dependent
             attrs['search'] = self._search_company_dependent
             attrs['depends_context'] = attrs.get('depends_context', ()) + ('company',)
-        if attrs.get('translate'):
-            # by default, translatable fields are context-dependent
-            attrs['depends_context'] = attrs.get('depends_context', ()) + ('lang',)
 
         # parameters 'depends' and 'depends_context' are stored in attributes
         # '_depends' and '_depends_context', respectively
@@ -439,14 +490,14 @@ class Field(MetaField('DummyField', (object,), {})):
         attrs = self._get_attrs(model_class, name)
 
         # determine parameters that must be validated
-        extra_keys = [key for key in attrs if not hasattr(self, key)]
+        extra_keys = tuple(key for key in attrs if not hasattr(self, key))
         if extra_keys:
             attrs['_extra_keys'] = extra_keys
 
         self.__dict__.update(attrs)
 
-        # prefetch only stored, column, non-manual and non-deprecated fields
-        if not (self.store and self.column_type) or self.manual or self.deprecated:
+        # prefetch only stored, column, non-manual fields
+        if not self.store or not self.column_type or self.manual:
             self.prefetch = False
 
         if not self.string and not self.related:
@@ -726,6 +777,7 @@ class Field(MetaField('DummyField', (object,), {})):
         for dotnames in registry.field_depends[self]:
             field_seq = []
             model_name = self.model_name
+            check_precompute = self.precompute
 
             for index, fname in enumerate(dotnames.split('.')):
                 Model = registry[model_name]
@@ -745,6 +797,21 @@ class Field(MetaField('DummyField', (object,), {})):
                     self.recursive = True
                     warnings.warn(f"Field {self} should be declared with recursive=True")
 
+                # precomputed fields can depend on non-precomputed ones, as long
+                # as they are reachable through at least one many2one field
+                if check_precompute and field.store and field.compute and not field.precompute:
+                    warnings.warn(f"Field {self} cannot be precomputed as it depends on non-precomputed field {field}")
+                    self.precompute = False
+
+                if field_seq and not field_seq[-1]._description_searchable:
+                    # the field before this one is not searchable, so there is
+                    # no way to know which on records to recompute self
+                    warnings.warn(
+                        f"Field {field_seq[-1]!r} in dependency of {self} should be searchable. "
+                        f"This is necessary to determine which records to recompute when {field} is modified. "
+                        f"You should either make the field searchable, or simplify the field dependency."
+                    )
+
                 field_seq.append(field)
 
                 # do not make self trigger itself: for instance, a one2many
@@ -753,9 +820,12 @@ class Field(MetaField('DummyField', (object,), {})):
                 if not (field is self and not index):
                     yield tuple(field_seq)
 
-                if field.type in ('one2many', 'many2many'):
+                if field.type == 'one2many':
                     for inv_field in Model.pool.field_inverses[field]:
                         yield tuple(field_seq) + (inv_field,)
+
+                if check_precompute and field.type == 'many2one':
+                    check_precompute = False
 
                 model_name = field.comodel_name
 
@@ -764,10 +834,12 @@ class Field(MetaField('DummyField', (object,), {})):
     # Field description
     #
 
-    def get_description(self, env):
+    def get_description(self, env, attributes=None):
         """ Return a dictionary that describes the field ``self``. """
-        desc = {'type': self.type}
+        desc = {}
         for attr, prop in self.description_attrs:
+            if attributes is not None and attr not in attributes:
+                continue
             if not prop.startswith('_description_'):
                 continue
             value = getattr(self, prop)
@@ -779,6 +851,8 @@ class Field(MetaField('DummyField', (object,), {})):
         return desc
 
     # properties used by get_description()
+    _description_name = property(attrgetter('name'))
+    _description_type = property(attrgetter('type'))
     _description_store = property(attrgetter('store'))
     _description_manual = property(attrgetter('manual'))
     _description_related = property(attrgetter('related'))
@@ -788,8 +862,9 @@ class Field(MetaField('DummyField', (object,), {})):
     _description_states = property(attrgetter('states'))
     _description_groups = property(attrgetter('groups'))
     _description_change_default = property(attrgetter('change_default'))
-    _description_deprecated = property(attrgetter('deprecated'))
     _description_group_operator = property(attrgetter('group_operator'))
+    _description_default_export_compatible = property(attrgetter('default_export_compatible'))
+    _description_exportable = property(attrgetter('exportable'))
 
     def _description_depends(self, env):
         return env.registry.field_depends[self]
@@ -805,14 +880,14 @@ class Field(MetaField('DummyField', (object,), {})):
     def _description_string(self, env):
         if self.string and env.lang:
             model_name = self.base_field.model_name
-            field_string = env['ir.translation'].get_field_string(model_name)
+            field_string = env['ir.model.fields'].get_field_string(model_name)
             return field_string.get(self.name) or self.string
         return self.string
 
     def _description_help(self, env):
         if self.help and env.lang:
             model_name = self.base_field.model_name
-            field_help = env['ir.translation'].get_field_help(model_name)
+            field_help = env['ir.model.fields'].get_field_help(model_name)
             return field_help.get(self.name) or self.help
         return self.help
 
@@ -843,6 +918,8 @@ class Field(MetaField('DummyField', (object,), {})):
         :meth:`BaseModel.write`. If the value represents a recordset, it should
         be added for prefetching on ``record``.
 
+        :param value:
+        :param record:
         :param bool validate: when True, field-specific validation of ``value``
             will be performed
         """
@@ -862,12 +939,14 @@ class Field(MetaField('DummyField', (object,), {})):
         """
         # spare the method lookup overhead
         convert = self.convert_to_record
-        return [convert(value, records) for value in values]
+        return [convert(value, record) for value, record in zip(values, records)]
 
     def convert_to_read(self, value, record, use_name_get=True):
         """ Convert ``value`` from the record format to the format returned by
         method :meth:`BaseModel.read`.
 
+        :param value:
+        :param record:
         :param bool use_name_get: when True, the value's display name will be
             computed using :meth:`BaseModel.name_get`, if relevant for the field
         """
@@ -885,6 +964,8 @@ class Field(MetaField('DummyField', (object,), {})):
         """ Convert ``value`` from the record format to the format returned by
         method :meth:`BaseModel.onchange`.
 
+        :param value:
+        :param record:
         :param names: a tree of field names (for relational fields only)
         """
         return self.convert_to_read(value, record)
@@ -897,12 +978,17 @@ class Field(MetaField('DummyField', (object,), {})):
 
     def convert_to_display_name(self, value, record):
         """ Convert ``value`` from the record format to a suitable display name. """
-        return ustr(value)
+        return ustr(value) if value else False
 
     ############################################################################
     #
     # Update database schema
     #
+
+    @property
+    def column_order(self):
+        """ Prescribed column order in table. """
+        return 0 if self.column_type is None else SQL_ORDER_BY_TYPE[self.column_type[0]]
 
     def update_db(self, model, columns):
         """ Update the database schema to implement this field.
@@ -952,17 +1038,13 @@ class Field(MetaField('DummyField', (object,), {})):
             return
         if column['udt_name'] == self.column_type[0]:
             return
-        if column['udt_name'] in self.column_cast_from:
-            sql.convert_column(model._cr, model._table, self.name, self.column_type[1])
-        else:
-            newname = (self.name + '_moved{}').format
-            i = 0
-            while sql.column_exists(model._cr, model._table, newname(i)):
-                i += 1
-            if column['is_nullable'] == 'NO':
-                sql.drop_not_null(model._cr, model._table, self.name)
-            sql.rename_column(model._cr, model._table, self.name, newname(i))
-            sql.create_column(model._cr, model._table, self.name, self.column_type[1], self.string)
+        if column['is_nullable'] == 'NO':
+            sql.drop_not_null(model._cr, model._table, self.name)
+        self._convert_db_column(model, column)
+
+    def _convert_db_column(self, model, column):
+        """ Convert the given database column to the type of the field. """
+        sql.convert_column(model._cr, model._table, self.name, self.column_type[1])
 
     def update_db_notnull(self, model, column):
         """ Add or remove the NOT NULL constraint on ``self``.
@@ -982,7 +1064,7 @@ class Field(MetaField('DummyField', (object,), {})):
             @model.pool.post_init
             def add_not_null():
                 # flush values before adding NOT NULL constraint
-                model.flush([self.name])
+                model.flush_model([self.name])
                 model.pool.post_constraint(apply_required, model, self.name)
 
         elif not self.required and has_notnull:
@@ -1014,7 +1096,8 @@ class Field(MetaField('DummyField', (object,), {})):
 
     def read(self, records):
         """ Read the value of ``self`` on ``records``, and store it in cache. """
-        raise NotImplementedError("Method read() undefined on %s" % self)
+        if not self.column_type:
+            raise NotImplementedError("Method read() undefined on %s" % self)
 
     def create(self, record_values):
         """ Write the value of ``self`` on the given records, which have just
@@ -1030,28 +1113,23 @@ class Field(MetaField('DummyField', (object,), {})):
         """ Write the value of ``self`` on ``records``. This method must update
         the cache and prepare database updates.
 
+        :param records:
         :param value: a value in any format
         :return: the subset of `records` that have been modified
         """
         # discard recomputation of self on records
         records.env.remove_to_compute(self, records)
 
-        # update the cache, and discard the records that are not modified
+        # discard the records that are not modified
         cache = records.env.cache
         cache_value = self.convert_to_cache(value, records)
         records = cache.get_records_different_from(records, self, cache_value)
         if not records:
             return records
-        cache.update(records, self, [cache_value] * len(records))
 
-        # update towrite
-        if self.store:
-            towrite = records.env.all.towrite[self.model_name]
-            record = records[:1]
-            write_value = self.convert_to_write(cache_value, record)
-            column_value = self.convert_to_column(write_value, record)
-            for record in records.filtered('id'):
-                towrite[record.id][self.name] = column_value
+        # update the cache
+        dirty = self.store and any(records._ids)
+        cache.update(records, self, itertools.repeat(cache_value), dirty=dirty)
 
         return records
 
@@ -1117,9 +1195,21 @@ class Field(MetaField('DummyField', (object,), {})):
                 value = env.cache.get(record, self)
 
             elif self.store and record._origin and not (self.compute and self.readonly):
-                # new record with origin: fetch from origin
-                value = self.convert_to_cache(record._origin[self.name], record, validate=False)
-                env.cache.set(record, self, value)
+                # new record with origin: fetch from origin, and assign the
+                # records to prefetch in cache (which is necessary for
+                # relational fields to "map" prefetching ids to their value)
+                recs = record._in_cache_without(self)
+                try:
+                    for rec in recs:
+                        if rec._origin:
+                            value = self.convert_to_cache(rec._origin[self.name], rec, validate=False)
+                            env.cache.set(rec, self, value)
+                    value = env.cache.get(record, self)
+                except (AccessError, MissingError):
+                    if len(recs) == 1:
+                        raise
+                    value = self.convert_to_cache(record._origin[self.name], record, validate=False)
+                    env.cache.set(record, self, value)
 
             elif self.compute:
                 # non-stored field or new record without origin: compute
@@ -1202,7 +1292,7 @@ class Field(MetaField('DummyField', (object,), {})):
             # many records as possible. If not done this way, scenarios such as
             # [rec.line_ids.mapped('name') for rec in recs] would generate one
             # query per record in `recs`!
-            remaining = records._browse(records.env, records[len(vals):]._ids, records._prefetch_ids)
+            remaining = records.__class__(records.env, records._ids[len(vals):], records._prefetch_ids)
             self.__get__(first(remaining), type(remaining))
             vals += records.env.cache.get_until_miss(remaining, self)
 
@@ -1259,10 +1349,29 @@ class Field(MetaField('DummyField', (object,), {})):
         if not to_compute_ids:
             return
 
+        def apply_except_missing(func, records):
+            """ Apply `func` on `records`, with a fallback ignoring non-existent records. """
+            try:
+                func(records)
+            except MissingError:
+                existing = records.exists()
+                if existing:
+                    func(existing)
+                # mark the field as computed on missing records, otherwise they
+                # remain to compute forever, which may lead to an infinite loop
+                missing = records - existing
+                for f in records.pool.field_computed[self]:
+                    records.env.remove_to_compute(f, missing)
+
         if self.recursive:
-            for record in records:
-                if record.id in to_compute_ids:
-                    self.compute_value(record)
+            # recursive computed fields are computed record by record, in order
+            # to recursively handle dependencies inside records
+            def recursive_compute(records):
+                for record in records:
+                    if record.id in to_compute_ids:
+                        self.compute_value(record)
+
+            apply_except_missing(recursive_compute, records)
             return
 
         for record in records:
@@ -1270,8 +1379,8 @@ class Field(MetaField('DummyField', (object,), {})):
                 ids = expand_ids(record.id, to_compute_ids)
                 recs = record.browse(itertools.islice(ids, PREFETCH_MAX))
                 try:
-                    self.compute_value(recs)
-                except (AccessError, MissingError):
+                    apply_except_missing(self.compute_value, recs)
+                except AccessError:
                     self.compute_value(record)
 
     def compute_value(self, records):
@@ -1402,8 +1511,6 @@ class Float(Field):
     """
 
     type = 'float'
-    column_cast_from = ('int4', 'numeric', 'float8')
-
     _digits = None                      # digits argument passed to class initializer
     group_operator = 'sum'
 
@@ -1471,9 +1578,7 @@ class Monetary(Field):
     """
     type = 'monetary'
     write_sequence = 10
-
     column_type = ('numeric', 'numeric')
-    column_cast_from = ('float8',)
 
     currency_field = None
     group_operator = 'sum'
@@ -1521,6 +1626,7 @@ class Monetary(Field):
             # BEWARE: do not prefetch other fields, because 'value' may be in
             # cache, and would be overridden by the value read from database!
             currency = record[:1].with_context(prefetch_fields=False)[currency_field_name]
+            currency = currency.with_env(record.env)
 
         value = float(value or 0.0)
         if currency:
@@ -1540,7 +1646,7 @@ class Monetary(Field):
             if len(currency) > 1:
                 raise ValueError("Got multiple currencies while assigning values of monetary field %s" % str(self))
             elif currency:
-                value = currency.round(value)
+                value = currency.with_env(record.env).round(value)
         return value
 
     def convert_to_record(self, value, record):
@@ -1556,7 +1662,7 @@ class Monetary(Field):
 class _String(Field):
     """ Abstract class for string fields. """
     translate = False                   # whether the field is translated
-    prefetch = None
+    unaccent = True
 
     def __init__(self, string=Default, **kwargs):
         # translate is either True, False, or a callable
@@ -1564,16 +1670,17 @@ class _String(Field):
             kwargs['translate'] = bool(kwargs['translate'])
         super(_String, self).__init__(string=string, **kwargs)
 
-    def _setup_attrs(self, model_class, name):
-        super()._setup_attrs(model_class, name)
-        if self.prefetch is None:
-            # do not prefetch complex translated fields by default
-            self.prefetch = not callable(self.translate)
-
     _related_translate = property(attrgetter('translate'))
 
     def _description_translate(self, env):
         return bool(self.translate)
+
+    def _convert_db_column(self, model, column):
+        # specialized implementation for converting from/to translated fields
+        if self.translate or column['udt_name'] == 'jsonb':
+            sql.convert_column_translatable(model._cr, model._table, self.name, self.column_type[1])
+        else:
+            sql.convert_column(model._cr, model._table, self.name, self.column_type[1])
 
     def get_trans_terms(self, value):
         """ Return the sequence of terms to translate found in `value`. """
@@ -1583,113 +1690,176 @@ class _String(Field):
         self.translate(terms.append, value)
         return terms
 
-    def get_trans_func(self, records):
-        """ Return a translation function `translate` for `self` on the given
-        records; the function call `translate(record_id, value)` translates the
-        field value to the language given by the environment of `records`.
-        """
+    def get_text_content(self, term):
+        """ Return the textual content for the given term. """
+        func = getattr(self.translate, 'get_text_content', lambda term: term)
+        return func(term)
+
+    def convert_to_column(self, value, record, values=None, validate=True):
+        cache_value = self.convert_to_cache(value, record, validate)
+        if cache_value is None:
+            return None
         if callable(self.translate):
-            rec_src_trans = records.env['ir.translation']._get_terms_translations(self, records)
+            # pylint: disable=not-callable
+            cache_value = self.translate(lambda t: None, cache_value)
+        if self.translate:
+            cache_value = {'en_US': cache_value, record.env.lang or 'en_US': cache_value}
+        return self._convert_from_cache_to_column(cache_value)
 
-            def translate(record_id, value):
-                src_trans = rec_src_trans[record_id]
-                return self.translate(src_trans.get, value)
+    def _convert_from_cache_to_column(self, value):
+        """ Convert from cache_raw value to column value """
+        if value is None:
+            return None
+        return PsycopgJson(value) if self.translate else value
 
-        else:
-            rec_trans = records.env['ir.translation']._get_ids(
-                '%s,%s' % (self.model_name, self.name), 'model', records.env.lang, records.ids)
+    def convert_to_cache(self, value, record, validate=True):
+        if value is None or value is False:
+            return None
+        return value
 
-            def translate(record_id, value):
-                return rec_trans.get(record_id) or value
+    def convert_to_record(self, value, record):
+        if value is None:
+            return False
+        if callable(self.translate) and record.env.context.get('edit_translations'):
+            terms = self.get_trans_terms(value)
+            base_lang = record._get_base_lang()
+            if base_lang != (record.env.lang or 'en_US'):
+                base_value = record.with_context(edit_translations=None, lang=base_lang)[self.name]
+                base_terms = self.get_trans_terms(base_value)
+                term_to_state = {term: "translated" if base_term != term else "to_translate" for term, base_term in zip(terms, base_terms)}
+            else:
+                term_to_state = defaultdict(lambda: 'translated')
+            # use a wrapper to let the frontend js code identify each term and its metadata in the 'edit_translations' context
+            # pylint: disable=not-callable
+            value = self.translate(
+                lambda term: f'''<span data-oe-model="{record._name}" data-oe-id="{record.id}" data-oe-field="{self.name}" data-oe-translation-state="{term_to_state[term]}" data-oe-translation-initial-sha="{sha256(term.encode()).hexdigest()}">{term}</span>''',
+                value
+            )
+        return value
 
-        return translate
+    def convert_to_write(self, value, record):
+        return value
+
+    def get_translation_dictionary(self, from_lang_value, to_lang_values):
+        """ Build a dictionary from terms in from_lang_value to terms in to_lang_values
+
+        :param str from_lang_value: from xml/html
+        :param dict to_lang_values: {lang: lang_value}
+
+        :return: {from_lang_term: {lang: lang_term}}
+        :rtype: dict
+        """
+
+        from_lang_terms = self.get_trans_terms(from_lang_value)
+        dictionary = defaultdict(lambda: defaultdict(dict))
+
+        for lang, to_lang_value in to_lang_values.items():
+            to_lang_terms = self.get_trans_terms(to_lang_value)
+            if len(from_lang_terms) != len(to_lang_terms):
+                for from_lang_term in from_lang_terms:
+                    dictionary[from_lang_term][lang] = from_lang_term
+            else:
+                for from_lang_term, to_lang_term in zip(from_lang_terms, to_lang_terms):
+                    dictionary[from_lang_term][lang] = to_lang_term
+        return dictionary
+
+    def _get_stored_translations(self, record):
+        """
+        : return: {'en_US': 'value_en_US', 'fr_FR': 'French'}
+        """
+        # assert (self.translate and self.store and record)
+        record.flush_recordset([self.name])
+        cr = record.env.cr
+        cr.execute(f'SELECT "{self.name}" FROM "{record._table}" WHERE id = %s', (record.id,))
+        res = cr.fetchone()
+        return res[0] if res else None
 
     def write(self, records, value):
-        # discard recomputation of self on records
-        records.env.remove_to_compute(self, records)
-
-        # update the cache, and discard the records that are not modified
+        if not self.translate or value is False or value is None:
+            return super().write(records, value)
         cache = records.env.cache
         cache_value = self.convert_to_cache(value, records)
         records = cache.get_records_different_from(records, self, cache_value)
         if not records:
             return records
-        cache.update(records, self, [cache_value] * len(records))
 
-        if not self.store:
+        # flush dirty None values
+        dirty_records = records & cache.get_dirty_records(records, self)
+        if any(v is None for v in cache.get_values(dirty_records, self)):
+            dirty_records.flush_recordset([self.name])
+
+        dirty = self.store and any(records._ids)
+        lang = records.env.lang or 'en_US'
+
+        # not dirty fields
+        if not dirty:
+            cache.update_raw(records, self, [{lang: cache_value} for _id in records._ids], dirty=False)
             return records
 
-        real_recs = records.filtered('id')
-        if not real_recs._ids:
+        # model translation
+        if not callable(self.translate):
+            # invalidate clean fields because them may contain fallback value
+            clean_records = records - cache.get_dirty_records(records, self)
+            clean_records.invalidate_recordset([self.name])
+            cache.update(records, self, itertools.repeat(cache_value), dirty=True)
+            if lang != 'en_US' and not records.env['res.lang']._lang_get_id('en_US'):
+                # if 'en_US' is not active, we always write en_US to make sure value_en is meaningful
+                cache.update(records.with_context(lang='en_US'), self, itertools.repeat(cache_value), dirty=True)
             return records
 
-        update_column = True
-        update_trans = False
-        single_lang = len(records.env['res.lang'].get_installed()) <= 1
-        if self.translate:
-            lang = records.env.lang or None  # used in _update_translations below
-            if single_lang:
-                # a single language is installed
-                update_trans = True
-            elif callable(self.translate) or lang == 'en_US':
-                # update the source and synchronize translations
-                update_column = True
-                update_trans = True
-            elif lang != 'en_US' and lang is not None:
-                # update the translations only except if emptying
-                update_column = not cache_value
-                update_trans = True
-            # else: lang = None
+        # model term translation
+        new_translations_list = []
+        # pylint: disable=not-callable
+        cache_value = self.translate(lambda t: None, cache_value)
+        new_terms = set(self.get_trans_terms(cache_value))
+        for record in records:
+            # shortcut when no term needs to be translated
+            if not new_terms:
+                new_translations_list.append({'en_US': cache_value, lang: cache_value})
+                continue
+            # _get_stored_translations can be refactored and prefetches translations for multi records,
+            # but it is really rare to write the same non-False/None/no-term value to multi records
+            old_translations = self._get_stored_translations(record)
+            if not old_translations:
+                new_translations_list.append({'en_US': cache_value, lang: cache_value})
+                continue
+            from_lang_value = old_translations.get(lang, old_translations['en_US'])
+            translation_dictionary = self.get_translation_dictionary(from_lang_value, old_translations)
+            text2terms = defaultdict(list)
+            for term in new_terms:
+                term_text = self.get_text_content(term)
+                if term_text:
+                    text2terms[term_text].append(term)
 
-        # update towrite if modifying the source
-        if update_column:
-            towrite = records.env.all.towrite[self.model_name]
-            for rid in real_recs._ids:
-                # cache_value is already in database format
-                towrite[rid][self.name] = cache_value
-            if self.translate is True and cache_value:
-                tname = "%s,%s" % (records._name, self.name)
-                records.env['ir.translation']._set_source(tname, real_recs._ids, value)
-            if self.translate:
-                # invalidate the field in the other languages
-                cache.invalidate([(self, records.ids)])
-                cache.update(records, self, [cache_value] * len(records))
-
-        if update_trans:
-            if callable(self.translate):
-                # the source value of self has been updated, synchronize
-                # translated terms when possible
-                records.env['ir.translation']._sync_terms_translations(self, real_recs)
-
-            else:
-                # update translations
-                value = self.convert_to_column(value, records)
-                source_recs = real_recs.with_context(lang=None)
-                source_value = first(source_recs)[self.name]
-                if not source_value:
-                    source_recs[self.name] = value
-                    source_value = value
-                tname = "%s,%s" % (self.model_name, self.name)
-                if not value:
-                    records.env['ir.translation'].search([
-                        ('name', '=', tname),
-                        ('type', '=', 'model'),
-                        ('res_id', 'in', real_recs._ids)
-                    ]).unlink()
-                elif single_lang:
-                    records.env['ir.translation']._update_translations([dict(
-                        src=source_value,
-                        value=value,
-                        name=tname,
-                        lang=lang,
-                        type='model',
-                        state='translated',
-                        res_id=res_id) for res_id in real_recs._ids])
-                else:
-                    records.env['ir.translation']._set_ids(
-                        tname, 'model', lang, real_recs._ids, value, source_value,
-                    )
-
+            is_text = self.translate.is_text if hasattr(self.translate, 'is_text') else lambda term: True
+            term_adapter = self.translate.term_adapter if hasattr(self.translate, 'term_adapter') else None
+            for old_term in list(translation_dictionary.keys()):
+                if old_term not in new_terms:
+                    old_term_text = self.get_text_content(old_term)
+                    matches = get_close_matches(old_term_text, text2terms, 1, 0.9)
+                    if matches:
+                        closest_term = get_close_matches(old_term, text2terms[matches[0]], 1, 0)[0]
+                        old_is_text = is_text(old_term)
+                        closest_is_text = is_text(closest_term)
+                        if old_is_text or not closest_is_text:
+                            if not closest_is_text and records.env.context.get("install_mode") and lang == 'en_US' and term_adapter:
+                                adapter = term_adapter(closest_term)
+                                if adapter(old_term) is None:  # old term and closest_term have different structures
+                                     continue
+                                translation_dictionary[closest_term] = {k: adapter(v) for k, v in translation_dictionary.pop(old_term).items()}
+                            else:
+                                translation_dictionary[closest_term] = translation_dictionary.pop(old_term)
+            # pylint: disable=not-callable
+            new_translations = {
+                l: self.translate(lambda term: translation_dictionary.get(term, {l: None})[l], cache_value)
+                for l in old_translations.keys()
+            }
+            new_translations[lang] = cache_value
+            if not records.env['res.lang']._lang_get_id('en_US'):
+                new_translations['en_US'] = cache_value
+            new_translations_list.append(new_translations)
+        # Maybe we can use Cache.update(records.with_context(cache_update_raw=True), self, new_translations_list, dirty=True)
+        cache.update_raw(records, self, new_translations_list, dirty=True)
         return records
 
 
@@ -1710,8 +1880,6 @@ class Char(_String):
     :type translate: bool or callable
     """
     type = 'char'
-    column_cast_from = ('text',)
-
     size = None                         # maximum size of values (deprecated)
     trim = True                         # whether value is trimmed (only by web client)
 
@@ -1722,16 +1890,17 @@ class Char(_String):
 
     @property
     def column_type(self):
-        return ('varchar', pg_varchar(self.size))
+        return ('jsonb', 'jsonb') if self.translate else ('varchar', pg_varchar(self.size))
 
     def update_db_column(self, model, column):
         if (
-            column and column['udt_name'] == 'varchar' and column['character_maximum_length'] and
+            column and self.column_type[0] == 'varchar' and
+            column['udt_name'] == 'varchar' and column['character_maximum_length'] and
             (self.size is None or column['character_maximum_length'] < self.size)
         ):
             # the column's varchar size does not match self.size; convert it
             sql.convert_column(model._cr, model._table, self.name, self.column_type[1])
-        super(Char, self).update_db_column(model, column)
+        super().update_db_column(model, column)
 
     _related_size = property(attrgetter('size'))
     _related_trim = property(attrgetter('trim'))
@@ -1743,7 +1912,7 @@ class Char(_String):
             return None
         # we need to convert the string to a unicode object to be able
         # to evaluate its length (and possibly truncate it) reliably
-        return pycompat.to_text(value)[:self.size]
+        return super().convert_to_column(pycompat.to_text(value)[:self.size], record, values, validate)
 
     def convert_to_cache(self, value, record, validate=True):
         if value is None or value is False:
@@ -1763,8 +1932,10 @@ class Text(_String):
     :type translate: bool or callable
     """
     type = 'text'
-    column_type = ('text', 'text')
-    column_cast_from = ('varchar',)
+
+    @property
+    def column_type(self):
+        return ('jsonb', 'jsonb') if self.translate else ('text', 'text')
 
     def convert_to_cache(self, value, record, validate=True):
         if value is None or value is False:
@@ -1776,6 +1947,8 @@ class Html(_String):
     """ Encapsulates an html code content.
 
     :param bool sanitize: whether value must be sanitized (default: ``True``)
+    :param bool sanitize_overridable: whether the sanitation can be bypassed by
+        the users part of the `base.group_sanitize_override` group (default: ``False``)
     :param bool sanitize_tags: whether to sanitize tags
         (only a white list of attributes is accepted, default: ``True``)
     :param bool sanitize_attributes: whether to sanitize attributes
@@ -1786,10 +1959,9 @@ class Html(_String):
     :param bool strip_classes: whether to strip classes attributes (default: ``False``)
     """
     type = 'html'
-    column_type = ('text', 'text')
-    column_cast_from = ('varchar',)
 
     sanitize = True                     # whether value must be sanitized
+    sanitize_overridable = False        # whether the sanitation can be bypassed by the users part of the `base.group_sanitize_override` group
     sanitize_tags = True                # whether to sanitize tags (only a white list of attributes is accepted)
     sanitize_attributes = True          # whether to sanitize attributes (only a white list of attributes is accepted)
     sanitize_style = False              # whether to sanitize style attributes
@@ -1804,6 +1976,10 @@ class Html(_String):
         if attrs.get('translate') is True and attrs.get('sanitize', True):
             attrs['translate'] = html_translate
         return attrs
+
+    @property
+    def column_type(self):
+        return ('jsonb', 'jsonb') if self.translate else ('text', 'text')
 
     _related_sanitize = property(attrgetter('sanitize'))
     _related_sanitize_tags = property(attrgetter('sanitize_tags'))
@@ -1820,32 +1996,55 @@ class Html(_String):
     _description_strip_classes = property(attrgetter('strip_classes'))
 
     def convert_to_column(self, value, record, values=None, validate=True):
-        if value is None or value is False:
-            return None
-        if self.sanitize:
-            return html_sanitize(
-                value, silent=True,
-                sanitize_tags=self.sanitize_tags,
-                sanitize_attributes=self.sanitize_attributes,
-                sanitize_style=self.sanitize_style,
-                sanitize_form=self.sanitize_form,
-                strip_style=self.strip_style,
-                strip_classes=self.strip_classes)
-        return value
+        return super().convert_to_column(self._convert(value, record, validate=True), record, values, validate=False)
 
     def convert_to_cache(self, value, record, validate=True):
+        return self._convert(value, record, validate)
+
+    def _convert(self, value, record, validate):
         if value is None or value is False:
             return None
-        if validate and self.sanitize:
-            return html_sanitize(
-                value, silent=True,
-                sanitize_tags=self.sanitize_tags,
-                sanitize_attributes=self.sanitize_attributes,
-                sanitize_style=self.sanitize_style,
-                sanitize_form=self.sanitize_form,
-                strip_style=self.strip_style,
-                strip_classes=self.strip_classes)
-        return value
+
+        if not validate or not self.sanitize:
+            return value
+
+        sanitize_vals = {
+            'silent': True,
+            'sanitize_tags': self.sanitize_tags,
+            'sanitize_attributes': self.sanitize_attributes,
+            'sanitize_style': self.sanitize_style,
+            'sanitize_form': self.sanitize_form,
+            'strip_style': self.strip_style,
+            'strip_classes': self.strip_classes
+        }
+
+        if self.sanitize_overridable:
+            if record.user_has_groups('base.group_sanitize_override'):
+                return value
+
+            original_value = record[self.name]
+            if original_value:
+                # Note that sanitize also normalize
+                original_value_sanitized = html_sanitize(original_value, **sanitize_vals)
+                original_value_normalized = html_normalize(original_value)
+
+                if (
+                    not original_value_sanitized  # sanitizer could empty it
+                    or original_value_normalized != original_value_sanitized
+                ):
+                    # The field contains element(s) that would be removed if
+                    # sanitized. It means that someone who was part of a group
+                    # allowing to bypass the sanitation saved that field
+                    # previously.
+                    raise UserError(_(
+                        "The field value you're saving (%s %s) includes content that is "
+                        "restricted for security reasons. It is possible that someone "
+                        "with higher privileges previously modified it, and you are therefore "
+                        "not able to modify it yourself while preserving the content.",
+                        record._description, self.string,
+                    ))
+
+        return html_sanitize(value, **sanitize_vals)
 
     def convert_to_record(self, value, record):
         r = super().convert_to_record(value, record)
@@ -1868,7 +2067,6 @@ class Date(Field):
     """ Encapsulates a python :class:`date <datetime.date>` object. """
     type = 'date'
     column_type = ('date', 'date')
-    column_cast_from = ('timestamp',)
 
     start_of = staticmethod(date_utils.start_of)
     end_of = staticmethod(date_utils.end_of)
@@ -1967,7 +2165,6 @@ class Datetime(Field):
     """ Encapsulates a python :class:`datetime <datetime.datetime>` object. """
     type = 'datetime'
     column_type = ('timestamp', 'timestamp')
-    column_cast_from = ('date',)
 
     start_of = staticmethod(date_utils.start_of)
     end_of = staticmethod(date_utils.end_of)
@@ -2173,7 +2370,8 @@ class Binary(Field):
                     except (TypeError):
                         pass
                     cache_value = self.convert_to_cache(value, record)
-                    cache.set(record, self, cache_value)
+                    dirty = self.column_type and self.store and any(records._ids)
+                    cache.set(record, self, cache_value, dirty=dirty)
                 except CacheMiss:
                     pass
         else:
@@ -2192,9 +2390,7 @@ class Binary(Field):
             att.res_id: att.datas
             for att in records.env['ir.attachment'].sudo().search(domain)
         }
-        cache = records.env.cache
-        for record in records:
-            cache.set(record, self, data.get(record.id, False))
+        records.env.cache.insert_missing(records, self, map(data.get, records._ids))
 
     def create(self, record_values):
         assert self.attachment
@@ -2234,7 +2430,7 @@ class Binary(Field):
             # determine records that are known to be not null
             not_null = cache.get_records_different_from(records, self, None)
 
-        cache.update(records, self, [cache_value] * len(records))
+        cache.update(records, self, itertools.repeat(cache_value))
 
         # retrieve the attachments that store the values, and adapt them
         if self.store and any(records._ids):
@@ -2298,7 +2494,7 @@ class Image(Binary):
             new_value = self._image_process(value)
             new_record_values.append((record, new_value))
             cache_value = self.convert_to_cache(value if self.related else new_value, record)
-            record.env.cache.update(record, self, [cache_value] * len(record))
+            record.env.cache.update(record, self, itertools.repeat(cache_value))
         super(Image, self).create(new_record_values)
 
     def write(self, records, value):
@@ -2316,13 +2512,21 @@ class Image(Binary):
 
         super(Image, self).write(records, new_value)
         cache_value = self.convert_to_cache(value if self.related else new_value, records)
-        records.env.cache.update(records, self, [cache_value] * len(records))
+        dirty = self.column_type and self.store and any(records._ids)
+        records.env.cache.update(records, self, itertools.repeat(cache_value), dirty=dirty)
 
     def _image_process(self, value):
-        return image_process(value,
+        if self.readonly and not self.max_width and not self.max_height:
+            # no need to process images for computed fields, or related fields
+            return value
+        try:
+            img = base64.b64decode(value or '') or False
+        except:
+            raise UserError(_("Image is not encoded in base64."))
+        return base64.b64encode(image_process(img,
             size=(self.max_width, self.max_height),
             verify_resolution=self.verify_resolution,
-        )
+        ) or b'') or False
 
     def _process_related(self, value):
         """Override to resize the related value before saving it on self."""
@@ -2417,10 +2621,10 @@ class Selection(Field):
         for field in self._base_fields:
             # We cannot use field.selection or field.selection_add here
             # because those attributes are overridden by ``_setup_attrs``.
-            if 'selection' in field.args:
+            if 'selection' in field._args__:
                 if self.related:
                     _logger.warning("%s: selection attribute will be ignored as the field is related", self)
-                selection = field.args['selection']
+                selection = field._args__['selection']
                 if isinstance(selection, list):
                     if values is not None and values != [kv[0] for kv in selection]:
                         _logger.warning("%s: selection=%r overrides existing selection; use selection_add instead", self, selection)
@@ -2433,16 +2637,16 @@ class Selection(Field):
                     self.selection = selection
                     self.ondelete = None
 
-            if 'selection_add' in field.args:
+            if 'selection_add' in field._args__:
                 if self.related:
                     _logger.warning("%s: selection_add attribute will be ignored as the field is related", self)
-                selection_add = field.args['selection_add']
+                selection_add = field._args__['selection_add']
                 assert isinstance(selection_add, list), \
                     "%s: selection_add=%r must be a list" % (self, selection_add)
                 assert values is not None, \
                     "%s: selection_add=%r on non-list selection %r" % (self, selection_add, self.selection)
 
-                ondelete = field.args.get('ondelete') or {}
+                ondelete = field._args__.get('ondelete') or {}
                 new_values = [kv[0] for kv in selection_add if kv[0] not in values]
                 for key in new_values:
                     ondelete.setdefault(key, 'set null')
@@ -2498,13 +2702,13 @@ class Selection(Field):
             module = field._module
             if not module:
                 continue
-            if 'selection' in field.args:
+            if 'selection' in field._args__:
                 value_modules.clear()
-                if isinstance(field.args['selection'], list):
-                    for value, label in field.args['selection']:
+                if isinstance(field._args__['selection'], list):
+                    for value, label in field._args__['selection']:
                         value_modules[value].add(module)
-            if 'selection_add' in field.args:
-                for value_label in field.args['selection_add']:
+            if 'selection_add' in field._args__:
+                for value_label in field._args__['selection_add']:
                     if len(value_label) > 1:
                         value_modules[value_label[0]].add(module)
         return value_modules
@@ -2519,7 +2723,7 @@ class Selection(Field):
 
         # translate selection labels
         if env.lang:
-            return env['ir.translation'].get_field_selection(self.model_name, self.name)
+            return env['ir.model.fields'].get_field_selection(self.model_name, self.name)
         else:
             return selection
 
@@ -2531,7 +2735,7 @@ class Selection(Field):
         """Return a list of the possible values."""
         selection = self.selection
         if isinstance(selection, str) or callable(selection):
-            selection = determine(selection, env[self.model_name])
+            selection = determine(selection, env[self.model_name].with_context(lang=None))
         return [value for value, _ in selection]
 
     def convert_to_column(self, value, record, values=None, validate=True):
@@ -2604,7 +2808,7 @@ class Reference(Selection):
         return value.display_name if value else ''
 
     def convert_to_display_name(self, value, record):
-        return ustr(value and value.display_name)
+        return value.display_name if value else False
 
 
 class _Relational(Field):
@@ -2806,14 +3010,14 @@ class Many2one(_Relational):
     def convert_to_record(self, value, record):
         # use registry to avoid creating a recordset for the model
         ids = () if value is None else (value,)
-        prefetch_ids = IterableGenerator(prefetch_many2one_ids, record, self)
-        return record.pool[self.comodel_name]._browse(record.env, ids, prefetch_ids)
+        prefetch_ids = PrefetchMany2one(record, self)
+        return record.pool[self.comodel_name](record.env, ids, prefetch_ids)
 
     def convert_to_record_multi(self, values, records):
         # return the ids as a recordset without duplicates
-        prefetch_ids = IterableGenerator(prefetch_many2one_ids, records, self)
+        prefetch_ids = PrefetchMany2one(records, self)
         ids = tuple(unique(id_ for id_ in values if id_ is not None))
-        return records.pool[self.comodel_name]._browse(records.env, ids, prefetch_ids)
+        return records.pool[self.comodel_name](records.env, ids, prefetch_ids)
 
     def convert_to_read(self, value, record, use_name_get=True):
         if use_name_get and value:
@@ -2847,7 +3051,7 @@ class Many2one(_Relational):
         return value.display_name if value else ''
 
     def convert_to_display_name(self, value, record):
-        return ustr(value.display_name)
+        return value.display_name
 
     def convert_to_onchange(self, value, record, names):
         # if value is a new record, serialize its origin instead
@@ -2868,14 +3072,8 @@ class Many2one(_Relational):
         self._remove_inverses(records, cache_value)
 
         # update the cache of self
-        cache.update(records, self, [cache_value] * len(records))
-
-        # update towrite
-        if self.store:
-            towrite = records.env.all.towrite[self.model_name]
-            for record in records.filtered('id'):
-                # cache_value is already in database format
-                towrite[record.id][self.name] = cache_value
+        dirty = self.store and any(records._ids)
+        cache.update(records, self, itertools.repeat(cache_value), dirty=dirty)
 
         # update the cache of one2many fields of new corecord
         self._update_inverses(records, cache_value)
@@ -2999,6 +3197,791 @@ class Many2oneReference(Integer):
         return model_ids
 
 
+class Json(Field):
+    """ JSON Field that contain unstructured information in jsonb PostgreSQL column.
+    This field is still in beta
+    Some features have not been implemented and won't be implemented in stable versions, including:
+    * searching
+    * indexing
+    * mutating the values.
+    """
+
+    type = 'json'
+    column_type = ('jsonb', 'jsonb')
+
+    def convert_to_record(self, value, record):
+        """ Return a copy of the value """
+        return False if value is None else copy.deepcopy(value)
+
+    def convert_to_cache(self, value, record, validate=True):
+        if not value:
+            return None
+        return json.loads(json.dumps(value))
+
+    def convert_to_column(self, value, record, values=None, validate=True):
+        if not value:
+            return None
+        return PsycopgJson(value)
+
+    def convert_to_export(self, value, record):
+        if not value:
+            return ''
+        return json.dumps(value)
+
+
+class Properties(Field):
+    """ Field that contains a list of properties (aka "sub-field") based on
+    a definition defined on a container. Properties are pseudo-fields, acting
+    like Odoo fields but without being independently stored in database.
+
+    This field allows a light customization based on a container record. Used
+    for relationships such as <project.project> / <project.task>,... New
+    properties can be created on the fly without changing the structure of the
+    database.
+
+    The "definition_record" define the field used to find the container of the
+    current record. The container must have a :class:`~odoo.fields.PropertiesDefinition`
+    field "definition_record_field" that contains the properties definition
+    (type of each property, default value)...
+
+    Only the value of each property is stored on the child. When we read the
+    properties field, we read the definition on the container and merge it with
+    the value of the child. That way the web client has access to the full
+    field definition (property type, ...).
+    """
+    type = 'properties'
+    column_type = ('jsonb', 'jsonb')
+    copy = False
+    prefetch = False
+    write_sequence = 10              # because it must be written after the definition field
+
+    # the field is computed editable by design (see the compute method below)
+    store = True
+    readonly = False
+    precompute = True
+
+    definition = None
+    definition_record = None         # field on the current model that point to the definition record
+    definition_record_field = None   # field on the definition record which defined the Properties field definition
+
+    _description_definition_record = property(attrgetter('definition_record'))
+    _description_definition_record_field = property(attrgetter('definition_record_field'))
+
+    ALLOWED_TYPES = (
+        'boolean', 'integer', 'float', 'char', 'date',
+        'datetime', 'many2one', 'many2many', 'selection', 'tags',
+    )
+
+    def _setup_attrs(self, model_class, name):
+        super()._setup_attrs(model_class, name)
+        self._setup_definition_attrs()
+
+    def _setup_definition_attrs(self):
+        if self.definition:
+            # determine definition_record and definition_record_field
+            assert self.definition.count(".") == 1
+            self.definition_record, self.definition_record_field = self.definition.rsplit('.', 1)
+
+            # make the field computed, and set its dependencies
+            self._depends = (self.definition_record, )
+            self.compute = self._compute
+
+    def setup_related(self, model):
+        super().setup_related(model)
+        if self.inherited_field and not self.definition:
+            self.definition = self.inherited_field.definition
+            self._setup_definition_attrs()
+
+    # Database/cache format: a value is either None, or a dict mapping property
+    # names to their corresponding value, like
+    #
+    #       {
+    #           '3adf37f3258cfe40': 'red',
+    #           'aa34746a6851ee4e': 1337,
+    #       }
+    #
+    def convert_to_column(self, value, record, values=None, validate=True):
+        if not value:
+            return None
+
+        value = self.convert_to_cache(value, record, validate=validate)
+        return json.dumps(value)
+
+    def convert_to_cache(self, value, record, validate=True):
+        # any format -> cache format {name: value} or None
+        if not value:
+            return None
+
+        if isinstance(value, dict):
+            # avoid accidental side effects from shared mutable data
+            return copy.deepcopy(value)
+
+        if isinstance(value, str):
+            value = json.loads(value)
+            if not isinstance(value, dict):
+                raise ValueError(f"Wrong property value {value!r}")
+            return value
+
+        if isinstance(value, list):
+            # Convert the list with all definitions into a simple dict
+            # {name: value} to store the strict minimum on the child
+            self._remove_display_name(value)
+            return self._list_to_dict(value)
+
+        raise ValueError(f"Wrong property type {type(value)!r}")
+
+    # Record format: the value is a list, where each element is a dict
+    # containing the definition of a property, together with the property's
+    # corresponding value, like
+    #
+    #       [{
+    #           'name': '3adf37f3258cfe40',
+    #           'string': 'Color Code',
+    #           'type': 'char',
+    #           'default': 'blue',
+    #           'value': 'red',
+    #       }, {
+    #           'name': 'aa34746a6851ee4e',
+    #           'string': 'Partner',
+    #           'type': 'many2one',
+    #           'comodel': 'test_new_api.partner',
+    #           'value': 1337,
+    #       }]
+    #
+    def convert_to_record(self, value, record):
+        # value is in cache format
+        definition = self._get_properties_definition(record)
+        if not value or not definition:
+            return definition or []
+
+        assert isinstance(value, dict), f"Wrong type {value!r}"
+        value = self._dict_to_list(value, definition)
+        self._parse_json_types(value, record.env)
+
+        return value
+
+    # Read format: almost identical to the record format, except that relational
+    # field values have a display name.
+    #
+    #       [{
+    #           'name': '3adf37f3258cfe40',
+    #           'string': 'Color Code',
+    #           'type': 'char',
+    #           'default': 'blue',
+    #           'value': 'red',
+    #       }, {
+    #           'name': 'aa34746a6851ee4e',
+    #           'string': 'Partner',
+    #           'type': 'many2one',
+    #           'comodel': 'test_new_api.partner',
+    #           'value': [1337, 'Bob'],
+    #       }]
+    #
+    def convert_to_read(self, value, record, use_name_get=True):
+        # value is in record format
+        if use_name_get:
+            self._add_display_name(value, record.env)
+        return value
+
+    def convert_to_write(self, value, record):
+        """If we write a list on the child, update the definition record."""
+        if isinstance(value, list):
+            # will update the definition record
+            self._remove_display_name(value)
+            return value
+
+        return super().convert_to_write(value, record)
+
+    def convert_to_onchange(self, value, record, names):
+        self._add_display_name(value, record.env)
+        return value
+
+    def read(self, records):
+        """Read everything needed in batch for the given records.
+
+        To retrieve relational properties names, or to check their existence,
+        we need to do some SQL queries. To reduce the number of queries when we read
+        in batch, we put in cache everything needed before calling
+        convert_to_record / convert_to_read.
+        """
+        definition_records_map = {
+            record: record[self.definition_record].sudo()[self.definition_record_field]
+            for record in records
+        }
+
+        # ids per model we need to fetch in batch to put in cache
+        ids_per_model = defaultdict(OrderedSet)
+
+        records_cached_values = list(records.env.cache.get_values(records, self))
+
+        for record, record_values in zip(records, records_cached_values):
+            definition = definition_records_map.get(record)
+            if not record_values or not definition:
+                continue
+            for property_definition in definition:
+                comodel = property_definition.get('comodel')
+                type_ = property_definition.get('type')
+                name = property_definition.get('name')
+                if not comodel or type_ not in ('many2one', 'many2many') or name not in record_values:
+                    continue
+
+                default = property_definition.get('default') or []
+                property_value = record_values[name] or []
+
+                if type_ == 'many2one':
+                    default = [default] if default else []
+                    property_value = [property_value] if property_value else []
+
+                ids_per_model[comodel].update(default)
+                ids_per_model[comodel].update(property_value)
+
+        # check existence and pre-fetch in batch
+        existing_ids_per_model = {}
+        for model, ids in ids_per_model.items():
+            recs = records.env[model].browse(ids).exists()
+            existing_ids_per_model[model] = set(recs.ids)
+            for record in recs:
+                # read a field to pre-fetch the recordset
+                try:
+                    record.display_name
+                except AccessError:
+                    pass
+
+        # update the cache and remove non-existing ids
+        for record, record_values in zip(records, records_cached_values):
+            definition = definition_records_map.get(record)
+            if not record_values or not definition:
+                continue
+
+            for property_definition in definition:
+                comodel = property_definition.get('comodel')
+                type_ = property_definition.get('type')
+                name = property_definition.get('name')
+                if not comodel or type_ not in ('many2one', 'many2many') or not record_values.get(name):
+                    continue
+
+                property_value = record_values[name]
+
+                if type_ == 'many2one':
+                    record_values[name] = property_value if property_value in existing_ids_per_model[comodel] else False
+                else:
+                    record_values[name] = [id_ for id_ in property_value if id_ in existing_ids_per_model[comodel]]
+
+            records.env.cache.update(record, self, [record_values], check_dirty=False)
+
+    def write(self, records, value):
+        """Check if the properties definition has been changed.
+
+        To avoid extra SQL queries used to detect definition change, we add a
+        flag in the properties list. Parent update is done only when this flag
+        is present, delegating the check to the caller (generally web client).
+
+        For deletion, we need to keep the removed property definition in the
+        list to be able to put the delete flag in it. Otherwise we have no way
+        to know that a property has been removed.
+        """
+        if isinstance(value, str):
+            value = json.loads(value)
+
+        if isinstance(value, dict):
+            # don't need to write on the container definition
+            return super().write(records, value)
+
+        definition_changed = any(
+            definition.get('definition_changed')
+            or definition.get('definition_deleted')
+            for definition in value
+        )
+        if definition_changed:
+            value = [
+                definition for definition in value
+                if not definition.get('definition_deleted')
+            ]
+            for definition in value:
+                definition.pop('definition_changed', None)
+
+            # update the properties definition on the container
+            container = records[self.definition_record]
+            if container:
+                properties_definition = copy.deepcopy(value)
+                for property_definition in properties_definition:
+                    property_definition.pop('value', None)
+                container[self.definition_record_field] = properties_definition
+
+                _logger.info('Properties field: User #%i changed definition of %r', records.env.user.id, container)
+
+        return super().write(records, value)
+
+    def _compute(self, records):
+        """Add the default properties value when the container is changed."""
+        for record in records:
+            record[self.name] = self._add_default_values(
+                record.env,
+                {self.name: record[self.name], self.definition_record: record[self.definition_record]},
+            )
+
+    def _add_default_values(self, env, values):
+        """Read the properties definition to add default values.
+
+        Default values are defined on the container in the 'default' key of
+        the definition.
+
+        :param env: environment
+        :param values: All values that will be written on the record
+        :return: Return the default values in the "dict" format
+        """
+        properties_values = values.get(self.name) or {}
+
+        if not values.get(self.definition_record):
+            # container is not given in the value, can not find properties definition
+            return properties_values
+
+        container_id = values[self.definition_record]
+        if not isinstance(container_id, (int, BaseModel)):
+            raise ValueError(f"Wrong container value {container_id!r}")
+
+        if isinstance(container_id, int):
+            # retrieve the container record
+            current_model = env[self.model_name]
+            definition_record_field = current_model._fields[self.definition_record]
+            container_model_name = definition_record_field.comodel_name
+            container_id = env[container_model_name].sudo().browse(container_id)
+
+        properties_definition = container_id[self.definition_record_field]
+        if not properties_definition:
+            return properties_values
+
+        assert isinstance(properties_values, (list, dict))
+        if isinstance(properties_values, list):
+            self._remove_display_name(properties_values)
+            properties_list_values = properties_values
+        else:
+            properties_list_values = self._dict_to_list(properties_values, properties_definition)
+
+        for properties_value in properties_list_values:
+            if properties_value.get('value') is None:
+                default = properties_value.get('default') or False
+                properties_value['value'] = default
+
+        return properties_list_values
+
+    def _get_properties_definition(self, record):
+        """Return the properties definition of the given record."""
+        container = record[self.definition_record]
+        if container:
+            return container.sudo()[self.definition_record_field]
+
+    @classmethod
+    def _add_display_name(cls, values_list, env, value_keys=('value', 'default')):
+        """Add the "name_get" for each many2one / many2many properties.
+
+        Modify in place "values_list".
+
+        :param values_list: List of properties definition and values
+        :param env: environment
+        """
+        for property_definition in values_list:
+            property_type = property_definition.get('type')
+            property_model = property_definition.get('comodel')
+            if not property_model:
+                continue
+
+            for value_key in value_keys:
+                property_value = property_definition.get(value_key)
+
+                if property_type == 'many2one' and property_value and isinstance(property_value, int):
+                    try:
+                        display_name = env[property_model].browse(property_value).display_name
+                        property_definition[value_key] = (property_value, display_name)
+                    except AccessError:
+                        # protect from access error message, show an empty name
+                        property_definition[value_key] = (property_value, None)
+                    except MissingError:
+                        property_definition[value_key] = False
+
+                elif property_type == 'many2many' and property_value and is_list_of(property_value, int):
+                    property_definition[value_key] = []
+                    records = env[property_model].browse(property_value)
+                    for record in records:
+                        try:
+                            property_definition[value_key].append((record.id, record.display_name))
+                        except AccessError:
+                            property_definition[value_key].append((record.id, None))
+                        except MissingError:
+                            continue
+
+    @classmethod
+    def _remove_display_name(cls, values_list, value_key='value'):
+        """Remove the display name received by the web client for the relational properties.
+
+        Modify in place "values_list".
+
+        - many2one: (35, 'Bob') -> 35
+        - many2many: [(35, 'Bob'), (36, 'Alice')] -> [35, 36]
+
+        :param values_list: List of properties definition with properties value
+        :param value_key: In which dict key we need to remove the display name
+        """
+        for property_definition in values_list:
+            if not isinstance(property_definition, dict) or not property_definition.get('name'):
+                continue
+
+            property_value = property_definition.get(value_key)
+            if not property_value:
+                continue
+
+            property_type = property_definition.get('type')
+
+            if property_type == 'many2one' and has_list_types(property_value, [int, (str, NoneType)]):
+                property_definition[value_key] = property_value[0]
+
+            elif property_type == 'many2many':
+                if is_list_of(property_value, (list, tuple)):
+                    # [(35, 'Admin'), (36, 'Demo')] -> [35, 36]
+                    property_definition[value_key] = [
+                        many2many_value[0]
+                        for many2many_value in property_value
+                    ]
+
+    @classmethod
+    def _add_missing_names(cls, values_list):
+        """Generate new properties name if needed.
+
+        Modify in place "values_list".
+
+        :param values_list: List of properties definition with properties value
+        """
+        for definition in values_list:
+            if definition.get('definition_changed') and not definition.get('name'):
+                # keep only the first 64 bits
+                definition['name'] = str(uuid.uuid4()).replace('-', '')[:16]
+
+    @classmethod
+    def _parse_json_types(cls, values_list, env):
+        """Parse the value stored in the JSON.
+
+        Check for records existence, if we removed a selection option, ...
+        Modify in place "values_list".
+
+        :param values_list: List of properties definition and values
+        :param env: environment
+        """
+        for property_definition in values_list:
+            property_value = property_definition.get('value')
+            property_type = property_definition.get('type')
+            res_model = property_definition.get('comodel')
+
+            if property_type not in cls.ALLOWED_TYPES:
+                raise ValueError(f'Wrong property type {property_type!r}')
+
+            if property_type == 'boolean':
+                # E.G. convert zero to False
+                property_value = bool(property_value)
+
+            elif property_type == 'char' and not isinstance(property_value, str) \
+                    and property_value is not None:
+                property_value = False
+
+            elif property_value and property_type == 'selection':
+                # check if the selection option still exists
+                options = property_definition.get('selection') or []
+                options = {option[0] for option in options if option or ()}  # always length 2
+                if property_value not in options:
+                    # maybe the option has been removed on the container
+                    property_value = False
+
+            elif property_value and property_type == 'tags':
+                # remove all tags that are not defined on the container
+                all_tags = {tag[0] for tag in property_definition.get('tags') or ()}
+                property_value = [tag for tag in property_value if tag in all_tags]
+
+            elif property_type == 'many2one' and property_value and res_model in env:
+                if not isinstance(property_value, int):
+                    raise ValueError(f'Wrong many2one value: {property_value!r}.')
+
+            elif property_type == 'many2many' and property_value and res_model in env:
+                if not is_list_of(property_value, int):
+                    raise ValueError(f'Wrong many2many value: {property_value!r}.')
+
+                if len(property_value) != len(set(property_value)):
+                    # remove duplicated value and preserve order
+                    property_value = list(dict.fromkeys(property_value))
+
+            property_definition['value'] = property_value
+
+    @classmethod
+    def _list_to_dict(cls, values_list):
+        """Convert a list of properties with definition into a dict {name: value}.
+
+        To not repeat data in database, we only store the value of each property on
+        the child. The properties definition is stored on the container.
+
+        E.G.
+            Input list:
+            [{
+                'name': '3adf37f3258cfe40',
+                'string': 'Color Code',
+                'type': 'char',
+                'default': 'blue',
+                'value': 'red',
+            }, {
+                'name': 'aa34746a6851ee4e',
+                'string': 'Partner',
+                'type': 'many2one',
+                'comodel': 'test_new_api.partner',
+                'value': [1337, 'Bob'],
+            }]
+
+            Output dict:
+            {
+                '3adf37f3258cfe40': 'red',
+                'aa34746a6851ee4e': 1337,
+            }
+
+        :param values_list: List of properties definition and value
+        :return: Generate a dict {name: value} from this definitions / values list
+        """
+        if not is_list_of(values_list, dict):
+            raise ValueError(f'Wrong properties value {values_list!r}')
+
+        cls._add_missing_names(values_list)
+
+        dict_value = {}
+        for property_definition in values_list:
+            property_value = property_definition.get('value')
+            property_type = property_definition.get('type')
+            property_model = property_definition.get('comodel')
+
+            if property_type not in ('integer', 'float') or property_value != 0:
+                property_value = property_value or False
+            if property_type in ('many2one', 'many2many') and property_model and property_value:
+                # check that value are correct before storing them in database
+                if property_type == 'many2many' and property_value and not is_list_of(property_value, int):
+                    raise ValueError(f"Wrong many2many value {property_value!r}")
+
+                if property_type == 'many2one' and not isinstance(property_value, int):
+                    raise ValueError(f"Wrong many2one value {property_value!r}")
+
+            dict_value[property_definition['name']] = property_value
+
+        return dict_value
+
+    @classmethod
+    def _dict_to_list(cls, values_dict, properties_definition):
+        """Convert a dict of {property: value} into a list of property definition with values.
+
+        :param values_dict: JSON value coming from the child table
+        :param properties_definition: Properties definition coming from the container table
+        :return: Merge both value into a list of properties with value
+            Ignore every values in the child that is not defined on the container.
+        """
+        if not is_list_of(properties_definition, dict):
+            raise ValueError(f'Wrong properties value {properties_definition!r}')
+
+        values_list = copy.deepcopy(properties_definition)
+        for property_definition in values_list:
+            property_definition['value'] = values_dict.get(property_definition['name'])
+        return values_list
+
+
+class PropertiesDefinition(Field):
+    """ Field used to define the properties definition (see :class:`~odoo.fields.Properties`
+    field). This field is used on the container record to define the structure
+    of expected properties on subrecords. It is used to check the properties
+    definition. """
+    type = 'properties_definition'
+    column_type = ('jsonb', 'jsonb')
+    copy = True                         # containers may act like templates, keep definitions to ease usage
+    readonly = False
+    prefetch = True
+
+    REQUIRED_KEYS = ('name', 'type')
+    ALLOWED_KEYS = (
+        'name', 'string', 'type', 'comodel', 'default',
+        'selection', 'tags', 'domain', 'view_in_kanban',
+    )
+    # those keys will be removed if the types does not match
+    PROPERTY_PARAMETERS_MAP = {
+        'comodel': {'many2one', 'many2many'},
+        'domain': {'many2one', 'many2many'},
+        'selection': {'selection'},
+        'tags': {'tags'},
+    }
+
+    def convert_to_column(self, value, record, values=None, validate=True):
+        """Convert the value before inserting it in database.
+
+        This method accepts a list properties definition.
+
+        The relational properties (many2one / many2many) default value
+        might contain the name_get of those records (and will be removed).
+
+        [{
+            'name': '3adf37f3258cfe40',
+            'string': 'Color Code',
+            'type': 'char',
+            'default': 'blue',
+            'default': 'red',
+        }, {
+            'name': 'aa34746a6851ee4e',
+            'string': 'Partner',
+            'type': 'many2one',
+            'comodel': 'test_new_api.partner',
+            'default': [1337, 'Bob'],
+        }]
+        """
+        if not value:
+            return None
+
+        if isinstance(value, str):
+            value = json.loads(value)
+
+        if not isinstance(value, list):
+            raise ValueError(f'Wrong properties definition type {type(value)!r}')
+
+        Properties._remove_display_name(value, value_key='default')
+
+        self._validate_properties_definition(value, record.env)
+
+        return json.dumps(value)
+
+    def convert_to_cache(self, value, record, validate=True):
+        # any format -> cache format (list of dicts or None)
+        if not value:
+            return None
+
+        if isinstance(value, list):
+            # avoid accidental side effects from shared mutable data, and make
+            # the value strict with respect to JSON (tuple -> list, etc)
+            value = json.dumps(value)
+
+        if isinstance(value, str):
+            value = json.loads(value)
+
+        if not isinstance(value, list):
+            raise ValueError(f'Wrong properties definition type {type(value)!r}')
+
+        Properties._remove_display_name(value, value_key='default')
+
+        self._validate_properties_definition(value, record.env)
+
+        return value
+
+    def convert_to_record(self, value, record):
+        # cache format -> record format (list of dicts)
+        if not value:
+            return []
+
+        # return a copy of the definition in cache where all property
+        # definitions have been cleaned up
+        result = []
+
+        for property_definition in value:
+            if not all(property_definition.get(key) for key in self.REQUIRED_KEYS):
+                # some required keys are missing, ignore this property definition
+                continue
+
+            # don't modify the value in cache
+            property_definition = dict(property_definition)
+
+            # check if the model still exists in the environment, the module of the
+            # model might have been uninstalled so the model might not exist anymore
+            property_model = property_definition.get('comodel')
+            if property_model and property_model not in record.env:
+                property_definition['comodel'] = property_model = False
+
+            if not property_model and 'domain' in property_definition:
+                del property_definition['domain']
+
+            property_domain = property_definition.get('domain')
+            if property_domain:
+                # some fields in the domain might have been removed
+                # (e.g. if the module has been uninstalled)
+                # check if the domain is still valid
+                try:
+                    expression.expression(
+                        ast.literal_eval(property_domain),
+                        record.env[property_model],
+                    )
+                except ValueError:
+                    del property_definition['domain']
+
+            result.append(property_definition)
+
+            for property_parameter, allowed_types in self.PROPERTY_PARAMETERS_MAP.items():
+                if property_definition.get('type') not in allowed_types:
+                    property_definition.pop(property_parameter, None)
+
+        return result
+
+    def convert_to_read(self, value, record, use_name_get=True):
+        # record format -> read format (list of dicts with display names)
+        if not value:
+            return value
+
+        if use_name_get:
+            Properties._add_display_name(value, record.env, value_keys=('default',))
+
+        return value
+
+    @classmethod
+    def _validate_properties_definition(cls, properties_definition, env):
+        """Raise an error if the property definition is not valid."""
+        properties_names = set()
+
+        for property_definition in properties_definition:
+            property_definition_keys = set(property_definition.keys())
+
+            invalid_keys = property_definition_keys - set(cls.ALLOWED_KEYS)
+            if invalid_keys:
+                raise ValueError(
+                    'Some key are not allowed for a properties definition [%s].' %
+                    ', '.join(invalid_keys),
+                )
+
+            required_keys = set(cls.REQUIRED_KEYS) - property_definition_keys
+            if required_keys:
+                raise ValueError(
+                    'Some key are missing for a properties definition [%s].' %
+                    ', '.join(required_keys),
+                )
+
+            property_name = property_definition.get('name')
+            if not property_name or property_name in properties_names:
+                raise ValueError(f'The property name {property_name!r} is not set or duplicated.')
+            properties_names.add(property_name)
+
+            property_type = property_definition.get('type')
+            if property_type and property_type not in Properties.ALLOWED_TYPES:
+                raise ValueError(f'Wrong property type {property_type!r}.')
+
+            model = property_definition.get('comodel')
+            if model and model not in env:
+                raise ValueError(f'Invalid model name {model!r}')
+
+            property_selection = property_definition.get('selection')
+            if property_selection:
+                if (not is_list_of(property_selection, (list, tuple))
+                   or not all(len(selection) == 2 for selection in property_selection)):
+                    raise ValueError(f'Wrong options {property_selection!r}.')
+
+                all_options = [option[0] for option in property_selection]
+                if len(all_options) != len(set(all_options)):
+                    duplicated = set(filter(lambda x: all_options.count(x) > 1, all_options))
+                    raise ValueError(f'Some options are duplicated: {", ".join(duplicated)}.')
+
+            property_tags = property_definition.get('tags')
+            if property_tags:
+                if (not is_list_of(property_tags, (list, tuple))
+                   or not all(len(tag) == 3 and isinstance(tag[2], int) for tag in property_tags)):
+                    raise ValueError(f'Wrong tags definition {property_tags!r}.')
+
+                all_tags = [tag[0] for tag in property_tags]
+                if len(all_tags) != len(set(all_tags)):
+                    duplicated = set(filter(lambda x: all_tags.count(x) > 1, all_tags))
+                    raise ValueError(f'Some tags are duplicated: {", ".join(duplicated)}.')
+
+
 class Command(enum.IntEnum):
     """
     :class:`~odoo.fields.One2many` and :class:`~odoo.fields.Many2many` fields
@@ -3117,7 +4100,7 @@ class Command(enum.IntEnum):
 
 
 class _RelationalMulti(_Relational):
-    """ Abstract class for relational fields *2many. """
+    r"Abstract class for relational fields \*2many."
     write_sequence = 20
 
     # Important: the cache contains the ids of all the records in the relation,
@@ -3167,7 +4150,7 @@ class _RelationalMulti(_Relational):
             comodel = record.env[self.comodel_name]
             # if record is new, the field's value is new records
             if record and not record.id:
-                browse = lambda it: comodel.browse([it and NewId(it)])
+                browse = lambda it: comodel.browse((it and NewId(it),))
             else:
                 browse = comodel.browse
             # determine the value ids
@@ -3206,9 +4189,9 @@ class _RelationalMulti(_Relational):
 
     def convert_to_record(self, value, record):
         # use registry to avoid creating a recordset for the model
-        prefetch_ids = IterableGenerator(prefetch_x2many_ids, record, self)
+        prefetch_ids = PrefetchX2many(record, self)
         Comodel = record.pool[self.comodel_name]
-        corecords = Comodel._browse(record.env, value, prefetch_ids)
+        corecords = Comodel(record.env, value, prefetch_ids)
         if (
             Comodel._active_name
             and self.context.get('active_test', record.env.context.get('active_test', True))
@@ -3218,10 +4201,10 @@ class _RelationalMulti(_Relational):
 
     def convert_to_record_multi(self, values, records):
         # return the list of ids as a recordset without duplicates
-        prefetch_ids = IterableGenerator(prefetch_x2many_ids, records, self)
+        prefetch_ids = PrefetchX2many(records, self)
         Comodel = records.pool[self.comodel_name]
         ids = tuple(unique(id_ for ids in values for id_ in ids))
-        corecords = Comodel._browse(records.env, ids, prefetch_ids)
+        corecords = Comodel(records.env, ids, prefetch_ids)
         if (
             Comodel._active_name
             and self.context.get('active_test', records.env.context.get('active_test', True))
@@ -3354,8 +4337,6 @@ class One2many(_RelationalMulti):
     :param bool auto_join: whether JOINs are generated upon search through that
         field (default: ``False``)
 
-    :param int limit: optional limit to use upon read
-
     The attributes ``comodel_name`` and ``inverse_name`` are mandatory except in
     the case of related fields or field extensions.
     """
@@ -3363,7 +4344,6 @@ class One2many(_RelationalMulti):
 
     inverse_name = None                 # name of the inverse field
     auto_join = False                   # whether joins are generated upon search
-    limit = None                        # optional limit to use upon read
     copy = False                        # o2m are not copied by default
 
     def __init__(self, comodel_name=Default, inverse_name=Default, string=Default, **kwargs):
@@ -3395,11 +4375,12 @@ class One2many(_RelationalMulti):
                 raise UserError(_("No inverse field %r found for %r") % (self.inverse_name, self.comodel_name))
 
     def get_domain_list(self, records):
-        comodel = records.env.registry[self.comodel_name]
-        inverse_field = comodel._fields[self.inverse_name]
-        domain = super(One2many, self).get_domain_list(records)
-        if inverse_field.type == 'many2one_reference':
-            domain = domain + [(inverse_field.model_field, '=', records._name)]
+        domain = super().get_domain_list(records)
+        if self.comodel_name and self.inverse_name:
+            comodel = records.env.registry[self.comodel_name]
+            inverse_field = comodel._fields[self.inverse_name]
+            if inverse_field.type == 'many2one_reference':
+                domain = domain + [(inverse_field.model_field, '=', records._name)]
         return domain
 
     def __get__(self, records, owner):
@@ -3408,7 +4389,7 @@ class One2many(_RelationalMulti):
             # cache value of self is consistent
             inverse_field = records.pool[self.comodel_name]._fields[self.inverse_name]
             if inverse_field.compute:
-                records.env[self.comodel_name].recompute([self.inverse_name])
+                records.env[self.comodel_name]._recompute_model([self.inverse_name])
         return super().__get__(records, owner)
 
     def read(self, records):
@@ -3418,9 +4399,22 @@ class One2many(_RelationalMulti):
         comodel = records.env[self.comodel_name].with_context(**context)
         inverse = self.inverse_name
         inverse_field = comodel._fields[inverse]
-        get_id = (lambda rec: rec.id) if inverse_field.type == 'many2one' else int
         domain = self.get_domain_list(records) + [(inverse, 'in', records.ids)]
-        lines = comodel.search(domain, limit=self.limit)
+        lines = comodel.search(domain)
+
+        get_id = (lambda rec: rec.id) if inverse_field.type == 'many2one' else int
+
+        if len(records) == 1:
+            # optimization: all lines have the same value for 'inverse_field',
+            # so we don't need to fetch it from database
+            if not inverse_field._description_searchable:
+                # fix: if the field is not searchable maybe we got some lines that are not linked to records
+                lines = lines.with_context(prefetch_fields=False).filtered(
+                    lambda line: get_id(line[inverse]) == records.id
+                )
+            records.env.cache.insert_missing(records, self, [lines._ids])
+            records.env.cache.insert_missing(lines, inverse_field, itertools.repeat(records.id))
+            return
 
         # group lines by inverse field (without prefetching other fields)
         group = defaultdict(list)
@@ -3429,9 +4423,8 @@ class One2many(_RelationalMulti):
             group[get_id(line[inverse])].append(line.id)
 
         # store result in cache
-        cache = records.env.cache
-        for record in records:
-            cache.set(record, self, tuple(group[record.id]))
+        values = [tuple(group[id_]) for id_ in records._ids]
+        records.env.cache.insert_missing(records, self, values)
 
     def write_real(self, records_commands_list, create=False):
         """ Update real records. """
@@ -3443,14 +4436,14 @@ class One2many(_RelationalMulti):
         comodel = model.env[self.comodel_name].with_context(**self.context)
         comodel = self._check_sudo_commands(comodel)
 
-        ids = {rid for recs, cs in records_commands_list for rid in recs.ids}
+        ids = OrderedSet(rid for recs, cs in records_commands_list for rid in recs.ids)
         records = records_commands_list[0][0].browse(ids)
 
         if self.store:
             inverse = self.inverse_name
-            to_create = []                  # line vals to create
-            to_delete = []                  # line ids to delete
-            to_link = defaultdict(set)      # {record: line_ids}
+            to_create = []                      # line vals to create
+            to_delete = []                      # line ids to delete
+            to_link = defaultdict(OrderedSet)   # {record: line_ids}
             allow_full_delete = not create
 
             def unlink(lines):
@@ -3494,9 +4487,15 @@ class One2many(_RelationalMulti):
                         to_link[recs[-1]].add(command[1])
                         allow_full_delete = False
                     elif command[0] in (Command.CLEAR, Command.SET):
-                        # do not try to delete anything in creation mode if nothing has been created before
                         line_ids = command[2] if command[0] == Command.SET else []
-                        if not allow_full_delete and not line_ids:
+                        if not allow_full_delete:
+                            # do not try to delete anything in creation mode if nothing has been created before
+                            if line_ids:
+                                # equivalent to Command.LINK
+                                if line_ids.__class__ is int:
+                                    line_ids = [line_ids]
+                                to_link[recs[-1]].update(line_ids)
+                                allow_full_delete = False
                             continue
                         flush()
                         # assign the given lines to the last record only
@@ -3534,7 +4533,7 @@ class One2many(_RelationalMulti):
                         link(recs[-1], comodel.browse(command[1]))
                     elif command[0] in (Command.CLEAR, Command.SET):
                         # assign the given lines to the last record only
-                        cache.update(recs, self, [()] * len(recs))
+                        cache.update(recs, self, itertools.repeat(()))
                         lines = comodel.browse(command[2] if command[0] == Command.SET else [])
                         cache.set(recs[-1], self, lines._ids)
 
@@ -3613,7 +4612,7 @@ class One2many(_RelationalMulti):
                         link(recs[-1], browse([command[1]]))
                     elif command[0] in (Command.CLEAR, Command.SET):
                         # assign the given lines to the last record only
-                        cache.update(recs, self, [()] * len(recs))
+                        cache.update(recs, self, itertools.repeat(()))
                         lines = comodel.browse(command[2] if command[0] == Command.SET else [])
                         cache.set(recs[-1], self, lines._ids)
 
@@ -3659,7 +4658,6 @@ class Many2many(_RelationalMulti):
         :meth:`~odoo.models.Model._check_company`. Add a default company
         domain depending on the field attributes.
 
-    :param int limit: optional limit to use upon read
     """
     type = 'many2many'
 
@@ -3668,7 +4666,6 @@ class Many2many(_RelationalMulti):
     column1 = None                      # column of table referring to model
     column2 = None                      # column of table referring to comodel
     auto_join = False                   # whether joins are generated upon search
-    limit = None                        # optional limit to use upon read
     ondelete = 'cascade'                # optional ondelete for the column2 fkey
 
     def __init__(self, comodel_name=Default, relation=Default, column1=Default,
@@ -3794,11 +4791,10 @@ class Many2many(_RelationalMulti):
         from_c, where_c, where_params = wquery.get_sql()
         query = """ SELECT {rel}.{id1}, {rel}.{id2} FROM {rel}, {from_c}
                     WHERE {where_c} AND {rel}.{id1} IN %s AND {rel}.{id2} = {tbl}.id
-                    {order_by} {limit} OFFSET {offset}
+                    {order_by}
                 """.format(rel=self.relation, id1=self.column1, id2=self.column2,
                            tbl=comodel._table, from_c=from_c, where_c=where_c or '1=1',
-                           limit=(' LIMIT %d' % self.limit) if self.limit else '',
-                           offset=0, order_by=order_by)
+                           order_by=order_by)
         where_params.append(tuple(records.ids))
 
         # retrieve lines and group them by record
@@ -3808,9 +4804,8 @@ class Many2many(_RelationalMulti):
             group[row[0]].append(row[1])
 
         # store result in cache
-        cache = records.env.cache
-        for record in records:
-            cache.set(record, self, tuple(group[record.id]))
+        values = [tuple(group[id_]) for id_ in records._ids]
+        records.env.cache.insert_missing(records, self, values)
 
     def write_real(self, records_commands_list, create=False):
         # records_commands_list = [(records, commands), ...]
@@ -3897,6 +4892,9 @@ class Many2many(_RelationalMulti):
         for record in records:
             cache.set(record, self, tuple(new_relation[record.id]))
 
+        # determine the corecords for which the relation has changed
+        modified_corecord_ids = set()
+
         # process pairs to add (beware of duplicates)
         pairs = [(x, y) for x, ys in new_relation.items() for y in ys - old_relation[x]]
         if pairs:
@@ -3910,6 +4908,7 @@ class Many2many(_RelationalMulti):
             y_to_xs = defaultdict(set)
             for x, y in pairs:
                 y_to_xs[y].add(x)
+                modified_corecord_ids.add(y)
             for invf in records.pool.field_inverses[self]:
                 domain = invf.get_domain_list(comodel)
                 valid_ids = set(records.filtered_domain(domain)._ids)
@@ -3930,6 +4929,7 @@ class Many2many(_RelationalMulti):
             y_to_xs = defaultdict(set)
             for x, y in pairs:
                 y_to_xs[y].add(x)
+                modified_corecord_ids.add(y)
 
             if self.store:
                 # express pairs as the union of cartesian products:
@@ -3957,6 +4957,16 @@ class Many2many(_RelationalMulti):
                         cache.set(corecord, invf, ids1)
                     except KeyError:
                         pass
+
+        if modified_corecord_ids:
+            # trigger the recomputation of fields that depend on the inverse
+            # fields of self on the modified corecords
+            corecords = comodel.browse(modified_corecord_ids)
+            corecords.modified([
+                invf.name
+                for invf in model.pool.field_inverses[self]
+                if invf.model_name == self.comodel_name
+            ])
 
         return records.filtered(
             lambda record: new_relation[record.id] != old_relation[record.id]
@@ -4018,6 +5028,9 @@ class Many2many(_RelationalMulti):
         for record in records:
             cache.set(record, self, tuple(new_relation[record.id]))
 
+        # determine the corecords for which the relation has changed
+        modified_corecord_ids = set()
+
         # process pairs to add (beware of duplicates)
         pairs = [(x, y) for x, ys in new_relation.items() for y in ys - old_relation[x]]
         if pairs:
@@ -4025,6 +5038,7 @@ class Many2many(_RelationalMulti):
             y_to_xs = defaultdict(set)
             for x, y in pairs:
                 y_to_xs[y].add(x)
+                modified_corecord_ids.add(y)
             for invf in records.pool.field_inverses[self]:
                 domain = invf.get_domain_list(comodel)
                 valid_ids = set(records.filtered_domain(domain)._ids)
@@ -4046,6 +5060,7 @@ class Many2many(_RelationalMulti):
             y_to_xs = defaultdict(set)
             for x, y in pairs:
                 y_to_xs[y].add(x)
+                modified_corecord_ids.add(y)
             for invf in records.pool.field_inverses[self]:
                 for y, xs in y_to_xs.items():
                     corecord = comodel.browse([y])
@@ -4055,6 +5070,16 @@ class Many2many(_RelationalMulti):
                         cache.set(corecord, invf, ids1)
                     except KeyError:
                         pass
+
+        if modified_corecord_ids:
+            # trigger the recomputation of fields that depend on the inverse
+            # fields of self on the modified corecords
+            corecords = comodel.browse(modified_corecord_ids)
+            corecords.modified([
+                invf.name
+                for invf in model.pool.field_inverses[self]
+                if invf.model_name == self.comodel_name
+            ])
 
         return records.filtered(
             lambda record: new_relation[record.id] != old_relation[record.id]
@@ -4091,22 +5116,42 @@ class Id(Field):
         raise TypeError("field 'id' cannot be assigned")
 
 
-def prefetch_many2one_ids(record, field):
-    """ Return an iterator over the ids of the cached values of a many2one
-        field for the prefetch set of a record.
-    """
-    records = record.browse(record._prefetch_ids)
-    ids = record.env.cache.get_values(records, field)
-    return unique(id_ for id_ in ids if id_ is not None)
+class PrefetchMany2one:
+    """ Iterable for the values of a many2one field on the prefetch set of a given record. """
+    __slots__ = 'record', 'field'
+
+    def __init__(self, record, field):
+        self.record = record
+        self.field = field
+
+    def __iter__(self):
+        records = self.record.browse(self.record._prefetch_ids)
+        ids = self.record.env.cache.get_values(records, self.field)
+        return unique(id_ for id_ in ids if id_ is not None)
+
+    def __reversed__(self):
+        records = self.record.browse(reversed(self.record._prefetch_ids))
+        ids = self.record.env.cache.get_values(records, self.field)
+        return unique(id_ for id_ in ids if id_ is not None)
 
 
-def prefetch_x2many_ids(record, field):
-    """ Return an iterator over the ids of the cached values of an x2many
-        field for the prefetch set of a record.
-    """
-    records = record.browse(record._prefetch_ids)
-    ids_list = record.env.cache.get_values(records, field)
-    return unique(id_ for ids in ids_list for id_ in ids)
+class PrefetchX2many:
+    """ Iterable for the values of an x2many field on the prefetch set of a given record. """
+    __slots__ = 'record', 'field'
+
+    def __init__(self, record, field):
+        self.record = record
+        self.field = field
+
+    def __iter__(self):
+        records = self.record.browse(self.record._prefetch_ids)
+        ids_list = self.record.env.cache.get_values(records, self.field)
+        return unique(id_ for ids in ids_list for id_ in ids)
+
+    def __reversed__(self):
+        records = self.record.browse(reversed(self.record._prefetch_ids))
+        ids_list = self.record.env.cache.get_values(records, self.field)
+        return unique(id_ for ids in ids_list for id_ in ids)
 
 
 def apply_required(model, field_name):
@@ -4123,6 +5168,6 @@ def apply_required(model, field_name):
 # pylint: disable=wrong-import-position
 from .exceptions import AccessError, MissingError, UserError
 from .models import (
-    check_pg_name, expand_ids, is_definition_class, is_registry_class,
+    check_pg_name, expand_ids, is_definition_class,
     BaseModel, IdType, NewId, PREFETCH_MAX,
 )

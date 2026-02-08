@@ -34,7 +34,7 @@ class IrConfigParameter(models.Model):
     _order = 'key'
     _allow_sudo_commands = False
 
-    key = fields.Char(required=True, index=True)
+    key = fields.Char(required=True)
     value = fields.Text(required=True)
 
     _sql_constraints = [
@@ -73,7 +73,7 @@ class IrConfigParameter(models.Model):
     def _get_param(self, key):
         # we bypass the ORM because get_param() is used in some field's depends,
         # and must therefore work even when the ORM is not ready to work
-        self.flush(['key', 'value'])
+        self.flush_model(['key', 'value'])
         self.env.cr.execute("SELECT value FROM ir_config_parameter WHERE key = %s", [key])
         result = self.env.cr.fetchone()
         return result and result[0]

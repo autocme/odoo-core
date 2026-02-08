@@ -2,6 +2,7 @@
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 
 import base64
+from collections import defaultdict
 import operator
 import re
 
@@ -22,16 +23,12 @@ class IrUiMenu(models.Model):
     _parent_store = True
     _allow_sudo_commands = False
 
-    def __init__(self, *args, **kwargs):
-        super(IrUiMenu, self).__init__(*args, **kwargs)
-        self.pool['ir.model.access'].register_cache_clearing_method(self._name, 'clear_caches')
-
     name = fields.Char(string='Menu', required=True, translate=True)
     active = fields.Boolean(default=True)
     sequence = fields.Integer(default=10)
     child_id = fields.One2many('ir.ui.menu', 'parent_id', string='Child IDs')
     parent_id = fields.Many2one('ir.ui.menu', string='Parent Menu', index=True, ondelete="restrict")
-    parent_path = fields.Char(index=True)
+    parent_path = fields.Char(index=True, unaccent=False)
     groups_id = fields.Many2many('res.groups', 'ir_ui_menu_group_rel',
                                  'menu_id', 'gid', string='Groups',
                                  help="If you have groups, the visibility of this menu will be based on these groups. "\
@@ -94,21 +91,37 @@ class IrUiMenu(models.Model):
             lambda menu: not menu.groups_id or menu.groups_id & groups)
 
         # take apart menus that have an action
-        action_menus = menus.filtered(lambda m: m.action and m.action.exists())
+        actions_by_model = defaultdict(set)
+        for action in menus.mapped('action'):
+            if action:
+                actions_by_model[action._name].add(action.id)
+        existing_actions = {
+            action
+            for model_name, action_ids in actions_by_model.items()
+            for action in self.env[model_name].browse(action_ids).exists()
+        }
+        action_menus = menus.filtered(lambda m: m.action and m.action in existing_actions)
         folder_menus = menus - action_menus
         visible = self.browse()
 
         # process action menus, check whether their action is allowed
         access = self.env['ir.model.access']
-        MODEL_GETTER = {
-            'ir.actions.act_window': lambda action: action.res_model,
-            'ir.actions.report': lambda action: action.model,
-            'ir.actions.server': lambda action: action.model_id.model,
+        MODEL_BY_TYPE = {
+            'ir.actions.act_window': 'res_model',
+            'ir.actions.report': 'model',
+            'ir.actions.server': 'model_name',
         }
+
+        # performance trick: determine the ids to prefetch by type
+        prefetch_ids = defaultdict(list)
+        for action in action_menus.mapped('action'):
+            prefetch_ids[action._name].append(action.id)
+
         for menu in action_menus:
-            get_model = MODEL_GETTER.get(menu.action._name)
-            if not get_model or not get_model(menu.action) or \
-                    access.check(get_model(menu.action), 'read', False):
+            action = menu.action
+            action = action.with_prefetch(prefetch_ids[action._name])
+            model_name = action._name in MODEL_BY_TYPE and action[MODEL_BY_TYPE[action._name]]
+            if not model_name or access.check(model_name, 'read', False):
                 # make menu visible, and its folder ancestors, too
                 visible += menu
                 menu = menu.parent_id

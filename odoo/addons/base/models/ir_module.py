@@ -29,7 +29,9 @@ from odoo.exceptions import AccessDenied, UserError, ValidationError
 from odoo.osv import expression
 from odoo.tools.parse_version import parse_version
 from odoo.tools.misc import topological_sort
+from odoo.tools.translate import TranslationImporter
 from odoo.http import request
+from odoo.modules import get_module_path, get_module_resource
 
 _logger = logging.getLogger(__name__)
 
@@ -80,6 +82,8 @@ class ModuleCategory(models.Model):
 
     @api.depends('module_ids')
     def _compute_module_nr(self):
+        self.env['ir.module.module'].flush_model(['category_id'])
+        self.flush_model(['parent_id'])
         cr = self._cr
         cr.execute('SELECT category_id, COUNT(*) \
                       FROM ir_module_module \
@@ -165,29 +169,37 @@ XML_DECLARATION = (
 class Module(models.Model):
     _name = "ir.module.module"
     _rec_name = "shortdesc"
+    _rec_names_search = ['name', 'shortdesc', 'summary']
     _description = "Module"
     _order = 'application desc,sequence,name'
     _allow_sudo_commands = False
 
     @api.model
-    def fields_view_get(self, view_id=None, view_type='form', toolbar=False, submenu=False):
-        res = super(Module, self).fields_view_get(view_id, view_type, toolbar=toolbar, submenu=False)
-        if view_type == 'form' and res.get('toolbar',False):
+    def get_views(self, views, options=None):
+        res = super().get_views(views, options)
+        if res['views'].get('form', {}).get('toolbar'):
             install_id = self.env.ref('base.action_server_module_immediate_install').id
-            action = [rec for rec in res['toolbar']['action'] if rec.get('id', False) != install_id]
-            res['toolbar'] = {'action': action}
+            action = [rec for rec in res['views']['form']['toolbar']['action'] if rec.get('id', False) != install_id]
+            res['views']['form']['toolbar'] = {'action': action}
         return res
 
     @classmethod
     def get_module_info(cls, name):
         try:
-            return modules.load_information_from_description_file(name)
+            return modules.get_manifest(name)
         except Exception:
             _logger.debug('Error when trying to fetch information for module %s', name, exc_info=True)
             return {}
 
     @api.depends('name', 'description')
     def _get_desc(self):
+        def _apply_description_images(doc):
+            html = lxml.html.document_fromstring(doc)
+            for element, attribute, link, pos in html.iterlinks():
+                if element.get('src') and not '//' in element.get('src') and not 'static/' in element.get('src'):
+                    element.set('src', "/%s/static/description/%s" % (module.name, element.get('src')))
+            return tools.html_sanitize(lxml.html.tostring(html))
+
         for module in self:
             if not module.name:
                 module.description_html = False
@@ -203,11 +215,7 @@ class Module(models.Model):
                             doc = doc.decode('utf-8')
                         except UnicodeDecodeError:
                             pass
-                    html = lxml.html.document_fromstring(doc)
-                    for element, attribute, link, pos in html.iterlinks():
-                        if element.get('src') and not '//' in element.get('src') and not 'static/' in element.get('src'):
-                            element.set('src', "/%s/static/description/%s" % (module.name, element.get('src')))
-                    module.description_html = tools.html_sanitize(lxml.html.tostring(html))
+                    module.description_html = _apply_description_images(doc)
             else:
                 overrides = {
                     'embed_stylesheet': False,
@@ -217,7 +225,7 @@ class Module(models.Model):
                     'file_insertion_enabled': False,
                 }
                 output = publish_string(source=module.description if not module.application and module.description else '', settings_overrides=overrides, writer=MyWriter())
-                module.description_html = tools.html_sanitize(output)
+                module.description_html = _apply_description_images(output)
 
     @api.depends('name')
     def _get_latest_version(self):
@@ -271,7 +279,7 @@ class Module(models.Model):
                 with tools.file_open(path, 'rb', filter_ext=('.png', '.svg', '.gif', '.jpeg', '.jpg')) as image_file:
                     module.icon_image = base64.b64encode(image_file.read())
 
-    name = fields.Char('Technical Name', readonly=True, required=True, index=True)
+    name = fields.Char('Technical Name', readonly=True, required=True)
     category_id = fields.Many2one('ir.module.category', string='Category', readonly=True, index=True)
     shortdesc = fields.Char('Module Name', readonly=True, translate=True)
     summary = fields.Char('Summary', readonly=True, translate=True)
@@ -507,6 +515,8 @@ class Module(models.Model):
         """
         if not self:
             return self
+        self.flush_model(['name', 'state'])
+        self.env['ir.module.module.dependency'].flush_model(['module_id', 'name'])
         known_deps = known_deps or self.browse()
         query = """ SELECT DISTINCT m.id
                     FROM ir_module_module_dependency d
@@ -531,6 +541,8 @@ class Module(models.Model):
         """
         if not self:
             return self
+        self.flush_model(['name', 'state'])
+        self.env['ir.module.module.dependency'].flush_model(['module_id', 'name'])
         known_deps = known_deps or self.browse()
         query = """ SELECT DISTINCT m.id
                     FROM ir_module_module_dependency d
@@ -565,6 +577,9 @@ class Module(models.Model):
         }
 
     def _button_immediate_function(self, function):
+        if not self.env.registry.ready or self.env.registry._init:
+            raise UserError(_('The method _button_immediate_install cannot be called on init or non loaded registries. Please use button_install instead.'))
+
         if getattr(threading.current_thread(), 'testing', False):
             raise RuntimeError(
                 "Module operations inside tests are not transactional and thus forbidden.\n"
@@ -586,6 +601,10 @@ class Module(models.Model):
         self._cr.commit()
         registry = modules.registry.Registry.new(self._cr.dbname, update_module=True)
         self._cr.commit()
+        if request and request.registry is self.env.registry:
+            request.env.cr.reset()
+            request.registry = request.env.registry
+            assert request.env.registry is registry
         self._cr.reset()
         assert self.env.registry is registry
 
@@ -722,18 +741,18 @@ class Module(models.Model):
             'to_buy': False
         }
 
-    @api.model
-    def create(self, vals):
-        new = super(Module, self).create(vals)
-        module_metadata = {
-            'name': 'module_%s' % vals['name'],
+    @api.model_create_multi
+    def create(self, vals_list):
+        modules = super().create(vals_list)
+        module_metadata_list = [{
+            'name': 'module_%s' % module.name,
             'model': 'ir.module.module',
             'module': 'base',
-            'res_id': new.id,
+            'res_id': module.id,
             'noupdate': True,
-        }
-        self.env['ir.model.data'].create(module_metadata)
-        return new
+        } for module in modules]
+        self.env['ir.model.data'].create(module_metadata_list)
+        return modules
 
     # update the list of available packages
     @assert_log_admin_access
@@ -885,6 +904,7 @@ class Module(models.Model):
         self._update_category(terp.get('category', 'Uncategorized'))
 
     def _update_dependencies(self, depends=None, auto_install_requirements=()):
+        self.env['ir.module.module.dependency'].flush_model()
         existing = set(dep.name for dep in self.dependencies_id)
         needed = set(depends or [])
         for dep in (needed - existing):
@@ -893,16 +913,18 @@ class Module(models.Model):
             self._cr.execute('DELETE FROM ir_module_module_dependency WHERE module_id = %s and name = %s', (self.id, dep))
         self._cr.execute('UPDATE ir_module_module_dependency SET auto_install_required = (name = any(%s)) WHERE module_id = %s',
                          (list(auto_install_requirements or ()), self.id))
-        self.invalidate_cache(['dependencies_id'], self.ids)
+        self.env['ir.module.module.dependency'].invalidate_model(['auto_install_required'])
+        self.invalidate_recordset(['dependencies_id'])
 
     def _update_exclusions(self, excludes=None):
+        self.env['ir.module.module.exclusion'].flush_model()
         existing = set(excl.name for excl in self.exclusion_ids)
         needed = set(excludes or [])
         for name in (needed - existing):
             self._cr.execute('INSERT INTO ir_module_module_exclusion (module_id, name) VALUES (%s, %s)', (self.id, name))
         for name in (existing - needed):
             self._cr.execute('DELETE FROM ir_module_module_exclusion WHERE module_id=%s AND name=%s', (self.id, name))
-        self.invalidate_cache(['exclusion_ids'], self.ids)
+        self.invalidate_recordset(['exclusion_ids'])
 
     def _update_category(self, category='Uncategorized'):
         current_category = self.category_id
@@ -934,12 +956,25 @@ class Module(models.Model):
             for mod in update_mods
         }
         mod_names = topological_sort(mod_dict)
-        self.env['ir.translation']._load_module_terms(mod_names, filter_lang, overwrite)
+        self.env['ir.module.module']._load_module_terms(mod_names, filter_lang, overwrite)
 
     def _check(self):
         for module in self:
             if not module.description_html:
                 _logger.warning('module %s: description is empty !', module.name)
+
+    def _get(self, name):
+        """ Return the (sudoed) `ir.module.module` record with the given name.
+        The result may be an empty recordset if the module is not found.
+        """
+        model_id = self._get_id(name) if name else False
+        return self.browse(model_id).sudo()
+
+    @tools.ormcache('name')
+    def _get_id(self, name):
+        self.flush_model(['name'])
+        self.env.cr.execute("SELECT id FROM ir_module_module WHERE name=%s", (name,))
+        return self.env.cr.fetchone()
 
     @api.model
     @tools.ormcache()
@@ -998,12 +1033,57 @@ class Module(models.Model):
 
         return super(Module, self).search_panel_select_range(field_name, **kwargs)
 
+    @api.model
+    def _load_module_terms(self, modules, langs, overwrite=False):
+        """ Load PO files of the given modules for the given languages. """
+        # load i18n files
+        translation_importer = TranslationImporter(self.env.cr, verbose=False)
+
+        for module_name in modules:
+            modpath = get_module_path(module_name)
+            if not modpath:
+                continue
+            for lang in langs:
+                lang_code = tools.get_iso_codes(lang)
+                base_lang_code = None
+                if '_' in lang_code:
+                    base_lang_code = lang_code.split('_')[0]
+
+                # Step 1: for sub-languages, load base language first (e.g. es_CL.po is loaded over es.po)
+                if base_lang_code:
+                    base_trans_file = get_module_resource(module_name, 'i18n', base_lang_code + '.po')
+                    if base_trans_file:
+                        _logger.info('module %s: loading base translation file %s for language %s', module_name, base_lang_code, lang)
+                        translation_importer.load_file(base_trans_file, lang)
+
+                    # i18n_extra folder is for additional translations handle manually (eg: for l10n_be)
+                    base_trans_extra_file = get_module_resource(module_name, 'i18n_extra', base_lang_code + '.po')
+                    if base_trans_extra_file:
+                        _logger.info('module %s: loading extra base translation file %s for language %s', module_name, base_lang_code, lang)
+                        translation_importer.load_file(base_trans_extra_file, lang)
+
+                # Step 2: then load the main translation file, possibly overriding the terms coming from the base language
+                trans_file = get_module_resource(module_name, 'i18n', lang_code + '.po')
+                if trans_file:
+                    _logger.info('module %s: loading translation file %s for language %s', module_name, lang_code, lang)
+                    translation_importer.load_file(trans_file, lang)
+                elif lang_code != 'en_US':
+                    _logger.info('module %s: no translation for language %s', module_name, lang_code)
+
+                trans_extra_file = get_module_resource(module_name, 'i18n_extra', lang_code + '.po')
+                if trans_extra_file:
+                    _logger.info('module %s: loading extra translation file %s for language %s', module_name, lang_code, lang)
+                    translation_importer.load_file(trans_extra_file, lang)
+
+        translation_importer.save(overwrite=overwrite)
+
 
 DEP_STATES = STATES + [('unknown', 'Unknown')]
 
 class ModuleDependency(models.Model):
     _name = "ir.module.module.dependency"
     _description = "Module dependency"
+    _log_access = False  # inserts are done manually, create and write uid, dates are always null
     _allow_sudo_commands = False
 
     # the dependency name

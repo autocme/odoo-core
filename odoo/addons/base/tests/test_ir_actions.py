@@ -24,9 +24,10 @@ class TestServerActionsBase(TransactionCaseWithUserDemo):
             'address_format': 'SuperFormat',
         })
         self.test_partner = self.env['res.partner'].create({
-            'name': 'TestingPartner',
             'city': 'OrigCity',
             'country_id': self.test_country.id,
+            'email': 'test.partner@test.example.com',
+            'name': 'TestingPartner',
         })
         self.context = {
             'active_model': 'res.partner',
@@ -44,7 +45,7 @@ class TestServerActionsBase(TransactionCaseWithUserDemo):
         self.res_partner_parent_field = Fields.search([('model', '=', 'res.partner'), ('name', '=', 'parent_id')])
         self.res_partner_children_field = Fields.search([('model', '=', 'res.partner'), ('name', '=', 'child_ids')])
         self.res_partner_category_field = Fields.search([('model', '=', 'res.partner'), ('name', '=', 'category_id')])
-        self.res_partner_credit_limit_field = Fields.search([('model', '=', 'res.partner'), ('name', '=', 'credit_limit')])
+        self.res_partner_latitude_field = Fields.search([('model', '=', 'res.partner'), ('name', '=', 'partner_latitude')])
         self.res_country_model = Model.search([('model', '=', 'res.country')])
         self.res_country_name_field = Fields.search([('model', '=', 'res.country'), ('name', '=', 'name')])
         self.res_country_code_field = Fields.search([('model', '=', 'res.country'), ('name', '=', 'code')])
@@ -174,6 +175,22 @@ class TestServerActions(TestServerActionsBase):
         partner = self.test_partner.search([('name', 'ilike', _name)])
         self.assertEqual(len(partner), 1, 'ir_actions_server: TODO')
         self.assertEqual(partner.city, 'OrigCity', 'ir_actions_server: TODO')
+
+    def test_object_write_equation(self):
+        # Do: update partners city
+        self.action.write({
+            'state': 'object_write',
+            'fields_lines': [Command.create({
+                'col1': self.res_partner_city_field.id,
+                'evaluation_type': 'equation',
+                'value': 'record.id',
+            })],
+        })
+        partners = self.test_partner + self.test_partner.copy()
+        self.action.with_context(self.context, active_ids=partners.ids).run()
+        # Test: partners updated
+        self.assertEqual(partners[0].city, str(partners[0].id))
+        self.assertEqual(partners[1].city, str(partners[1].id))
 
     @mute_logger('odoo.addons.base.models.ir_model', 'odoo.models')
     def test_40_multi(self):
@@ -317,10 +334,10 @@ class TestServerActions(TestServerActionsBase):
             self_demo.with_context(self.context).run()
 
     def test_90_convert_to_float(self):
-        #make sure eval_value convert the value into float for float-type fields
+        # make sure eval_value convert the value into float for float-type fields
         self.action.write({
             'state': 'object_write',
-            'fields_lines': [Command.create({'col1': self.res_partner_credit_limit_field.id, 'value': '20.99'})],
+            'fields_lines': [Command.create({'col1': self.res_partner_latitude_field.id, 'value': '20.99'})],
         })
         line = self.action.fields_lines[0]
         self.assertEqual(line.eval_value()[line.id], 20.99)
@@ -431,12 +448,15 @@ class TestCustomFields(common.TransactionCase):
         self.assertIn('x_foo', self.env[self.MODEL]._fields)
 
     def test_unlink_base(self):
-        """ one cannot delete a non-custom field """
+        """ one cannot delete a non-custom field expect for uninstallation """
         field = self.env['ir.model.fields']._get(self.MODEL, 'ref')
         self.assertTrue(field)
 
         with self.assertRaisesRegex(UserError, 'This column contains module data'):
             field.unlink()
+
+        # but it works in the context of uninstalling a module
+        field.with_context(_force_unlink=True).unlink()
 
     def test_unlink_with_inverse(self):
         """ create a custom o2m and then delete its m2o inverse """
@@ -543,22 +563,26 @@ class TestCustomFields(common.TransactionCase):
         partners = self.env['res.partner'].create([
             {'name': country.code, 'country_id': country.id} for country in countries
         ])
-        partners.flush()
+        self.env.flush_all()
 
-        # determine how many queries it takes to create a non-computed field
-        query_count = self.cr.sql_log_count
-        self.env['ir.model.fields'].create({
-            'model_id': self.env['ir.model']._get_id('res.partner'),
-            'name': 'x_oh_box',
-            'field_description': 'x_oh_box',
-            'ttype': 'char',
-        })
-        query_count = self.cr.sql_log_count - query_count
-
-        # create the related field, and assert it only takes 1 extra query
-        with self.assertQueryCount(query_count + 1):
+        # create a non-computed field, and assert how many queries it takes
+        model_id = self.env['ir.model']._get_id('res.partner')
+        query_count = 41
+        with self.assertQueryCount(query_count):
+            self.env.registry.clear_caches()
             self.env['ir.model.fields'].create({
-                'model_id': self.env['ir.model']._get_id('res.partner'),
+                'model_id': model_id,
+                'name': 'x_oh_box',
+                'field_description': 'x_oh_box',
+                'ttype': 'char',
+                'store': True,
+            })
+
+        # same with a related field, it only takes 8 extra queries
+        with self.assertQueryCount(query_count + 8):
+            self.env.registry.clear_caches()
+            self.env['ir.model.fields'].create({
+                'model_id': model_id,
                 'name': 'x_oh_boy',
                 'field_description': 'x_oh_boy',
                 'ttype': 'char',
@@ -569,6 +593,21 @@ class TestCustomFields(common.TransactionCase):
         # check the computed values
         for partner in partners:
             self.assertEqual(partner.x_oh_boy, partner.country_id.code)
+
+    def test_relation_of_a_custom_field(self):
+        """ change the relation model of a custom field """
+        model = self.env['ir.model'].search([('model', '=', self.MODEL)])
+        field = self.env['ir.model.fields'].create({
+            'name': 'x_foo',
+            'model_id': model.id,
+            'field_description': 'x_foo',
+            'ttype': 'many2many',
+            'relation': self.COMODEL,
+        })
+
+        # change the relation
+        with self.assertRaises(ValidationError):
+            field.relation = 'foo'
 
     def test_selection(self):
         """ custom selection field """

@@ -29,8 +29,9 @@ class TestXMLTools(common.TransactionCase):
                 <h2>text</h2>
         \t<h2><h3/></h2>
             <h2>            </h2>
+
 </h1>"""
-        qweb = self.qweb_poor._render()
+        qweb = self.env['ir.qweb']._render(self.qweb_poor.id)
         self.check_xml_cleanup_result_is_as_expected(qweb, expected, remove_blank_text=False, remove_blank_nodes=False, indent_level=-1)
 
     def test_cleanup_xml_node_indent_level(self):
@@ -45,7 +46,7 @@ __</h2>
 __<h2>            </h2>
 _</h1>
 """
-        qweb = self.qweb_poor._render()
+        qweb = self.env['ir.qweb']._render(self.qweb_poor.id)
         self.check_xml_cleanup_result_is_as_expected(qweb, expected, remove_blank_text=False, remove_blank_nodes=False, indent_level=1, indent_space="_")
 
     def test_cleanup_xml_node_keep_blank_text(self):
@@ -55,7 +56,7 @@ _</h1>
   <h2>            </h2>
 </h1>
 """
-        qweb = self.qweb_poor._render()
+        qweb = self.env['ir.qweb']._render(self.qweb_poor.id)
         self.check_xml_cleanup_result_is_as_expected(qweb, expected, remove_blank_text=False)
 
     def test_cleanup_xml_node_keep_blank_nodes(self):
@@ -69,7 +70,7 @@ _</h1>
   <h2></h2>
 </h1>
 """
-        qweb = self.qweb_poor._render()
+        qweb = self.env['ir.qweb']._render(self.qweb_poor.id)
         self.check_xml_cleanup_result_is_as_expected(qweb, expected, remove_blank_nodes=False)
 
     def test_cleanup_xml_t_call_indent(self):
@@ -97,7 +98,7 @@ _</h1>
   </data>
 </odoo>
 """
-        qweb = template_2._render()
+        qweb = self.env['ir.qweb']._render(template_2.id)
         self.check_xml_cleanup_result_is_as_expected(qweb, expected)
 
     def test_qweb_render_values_empty_nodes(self):
@@ -133,7 +134,7 @@ _</h1>
   </addressRecipient>
 </data>
 """
-        qweb = template_main._render({
+        qweb = self.env['ir.qweb']._render(template_main.id, {
             'items': [1, 2, "Three", False],
             'addressRecipient': {
                 'number': '221B',

@@ -4,14 +4,12 @@
     'version': '0.1',
     'category': 'Hidden/Tests',
     'description': """A module to verify the Assets Bundle mechanism.""",
-    'maintainer': 'Odoo SA',
     'depends': ['base'],
     'installable': True,
     'data': [
         "data/ir_asset.xml",
         "views/views.xml",
     ],
-    'auto_install': False,
 
     'assets': {
         'test_assetsbundle.bundle2': [
@@ -60,6 +58,9 @@
         'test_assetsbundle.manifest_multi_module1': [],
         'test_assetsbundle.broken_css': [
             'test_assetsbundle/static/invalid_src/css/invalid_css.css',
+        ],
+        'test_assetsbundle.lazy_test_component': [
+            'test_assetsbundle/static/tests/lazy_test_component/**/*',
         ],
     },
     'license': 'LGPL-3',

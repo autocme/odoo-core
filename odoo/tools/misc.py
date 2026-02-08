@@ -7,6 +7,7 @@ Miscellaneous tools used by OpenERP.
 """
 import cProfile
 import collections
+import contextlib
 import datetime
 import hmac as hmac_lib
 import hashlib
@@ -24,10 +25,10 @@ import time
 import traceback
 import types
 import unicodedata
-import zipfile
+import warnings
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping, MutableMapping, MutableSet
-from contextlib import contextmanager
+from contextlib import ContextDecorator, contextmanager
 from difflib import HtmlDiff
 from functools import wraps
 from itertools import islice, groupby as itergroupby
@@ -77,6 +78,7 @@ def find_in_path(name):
     return which(name, path=os.pathsep.join(path))
 
 def _exec_pipe(prog, args, env=None):
+    warnings.warn("Since 16.0, just use `subprocess`.", DeprecationWarning, stacklevel=3)
     cmd = (prog,) + args
     # on win32, passing close_fds=True is not compatible
     # with redirecting std[in/err/out]
@@ -85,6 +87,7 @@ def _exec_pipe(prog, args, env=None):
     return pop.stdin, pop.stdout
 
 def exec_command_pipe(name, *args):
+    warnings.warn("Since 16.0, use `subprocess` directly.", DeprecationWarning, stacklevel=2)
     prog = find_in_path(name)
     if not prog:
         raise Exception('Command `%s` not found.' % name)
@@ -127,6 +130,7 @@ def exec_pg_environ():
     return env
 
 def exec_pg_command(name, *args):
+    warnings.warn("Since 16.0, use `subprocess` directly.", DeprecationWarning, stacklevel=2)
     prog = find_pg_tool(name)
     env = exec_pg_environ()
     args2 = (prog,) + args
@@ -135,6 +139,7 @@ def exec_pg_command(name, *args):
         raise Exception('Postgres subprocess %s error %s' % (args2, rc))
 
 def exec_pg_command_pipe(name, *args):
+    warnings.warn("Since 16.0, use `subprocess` directly.", DeprecationWarning, stacklevel=2)
     prog = find_pg_tool(name)
     env = exec_pg_environ()
     return _exec_pipe(prog, args, env)
@@ -190,10 +195,10 @@ def file_open(name, mode="r", filter_ext=None, env=None):
 
     Examples::
 
-    >>> file_open('hr/static/description/icon.png')
-    >>> file_open('hr/static/description/icon.png', filter_ext=('.png', '.jpg'))
-    >>> with file_open('/opt/odoo/addons/hr/static/description/icon.png', 'rb') as f:
-    ...     contents = f.read()
+        >>> file_open('hr/static/description/icon.png')
+        >>> file_open('hr/static/description/icon.png', filter_ext=('.png', '.jpg'))
+        >>> with file_open('/opt/odoo/addons/hr/static/description/icon.png', 'rb') as f:
+        ...     contents = f.read()
 
     :param name: absolute or relative path to a file located inside an addon
     :param mode: file open mode, as for `open()`
@@ -281,24 +286,25 @@ def reverse_enumerate(l):
     """Like enumerate but in the other direction
 
     Usage::
-    >>> a = ['a', 'b', 'c']
-    >>> it = reverse_enumerate(a)
-    >>> it.next()
-    (2, 'c')
-    >>> it.next()
-    (1, 'b')
-    >>> it.next()
-    (0, 'a')
-    >>> it.next()
-    Traceback (most recent call last):
-      File "<stdin>", line 1, in <module>
-    StopIteration
+
+        >>> a = ['a', 'b', 'c']
+        >>> it = reverse_enumerate(a)
+        >>> it.next()
+        (2, 'c')
+        >>> it.next()
+        (1, 'b')
+        >>> it.next()
+        (0, 'a')
+        >>> it.next()
+        Traceback (most recent call last):
+          File "<stdin>", line 1, in <module>
+        StopIteration
     """
     return zip(range(len(l)-1, -1, -1), reversed(l))
 
 def partition(pred, elems):
     """ Return a pair equivalent to:
-        ``filter(pred, elems), filter(lambda x: not pred(x), elems)` """
+    ``filter(pred, elems), filter(lambda x: not pred(x), elems)`` """
     yes, nos = [], []
     for elem in elems:
         (yes if pred(elem) else nos).append(elem)
@@ -409,6 +415,7 @@ except ImportError:
 
 
 def to_xml(s):
+    warnings.warn("Since 16.0, use proper escaping methods (e.g. `markupsafe.escape`).", DeprecationWarning, stacklevel=2)
     return s.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
 
 def get_iso_codes(lang):
@@ -482,6 +489,7 @@ def human_size(sz):
     return "%0.2f %s" % (s, units[i])
 
 def logged(f):
+    warnings.warn("Since 16.0, it's never been super useful.", DeprecationWarning, stacklevel=2)
     @wraps(f)
     def wrapper(*args, **kwargs):
         from pprint import pformat
@@ -504,6 +512,7 @@ def logged(f):
 
 class profile(object):
     def __init__(self, fname=None):
+        warnings.warn("Since 16.0.", DeprecationWarning, stacklevel=2)
         self.fname = fname
 
     def __call__(self, f):
@@ -522,6 +531,7 @@ def detect_ip_addr():
        for binding to an interface, but it could be used as basis
        for constructing a remote URL to the server.
     """
+    warnings.warn("Since 16.0.", DeprecationWarning, stacklevel=2)
     def _detect_ip_addr():
         from array import array
         from struct import pack, unpack
@@ -706,29 +716,23 @@ def split_every(n, iterable, piece_maker=tuple):
         yield piece
         piece = piece_maker(islice(iterator, n))
 
-def get_and_group_by_field(cr, uid, obj, ids, field, context=None):
-    """ Read the values of ``field´´ for the given ``ids´´ and group ids by value.
-
-       :param string field: name of the field we want to read and group by
-       :return: mapping of field values to the list of ids that have it
-       :rtype: dict
-    """
-    res = {}
-    for record in obj.read(cr, uid, ids, [field], context=context):
-        key = record[field]
-        res.setdefault(key[0] if isinstance(key, tuple) else key, []).append(record['id'])
-    return res
-
-def get_and_group_by_company(cr, uid, obj, ids, context=None):
-    return get_and_group_by_field(cr, uid, obj, ids, field='company_id', context=context)
-
 # port of python 2.6's attrgetter with support for dotted notation
-def resolve_attr(obj, attr):
+raise_error = object()  # sentinel
+def resolve_attr(obj, attr, default=raise_error):
+    warnings.warn(
+        "Since 16.0, component of `attrgetter`.",
+        stacklevel=2
+    )
     for name in attr.split("."):
-        obj = getattr(obj, name)
+        obj = getattr(obj, name, default)
+        if obj is raise_error:
+            raise AttributeError(f"'{obj}' object has no attribute '{name}'")
+        if obj == default:
+            break
     return obj
 
 def attrgetter(*items):
+    warnings.warn("Since 16.0, super old backport of Python 2.6's `operator.attrgetter`.", stacklevel=2)
     if len(items) == 1:
         attr = items[0]
         def g(obj):
@@ -780,37 +784,11 @@ class unquote(str):
     def __repr__(self):
         return self
 
-class UnquoteEvalContext(defaultdict):
-    """Defaultdict-based evaluation context that returns
-       an ``unquote`` string for any missing name used during
-       the evaluation.
-       Mostly useful for evaluating OpenERP domains/contexts that
-       may refer to names that are unknown at the time of eval,
-       so that when the context/domain is converted back to a string,
-       the original names are preserved.
 
-       **Warning**: using an ``UnquoteEvalContext`` as context for ``eval()`` or
-       ``safe_eval()`` will shadow the builtins, which may cause other
-       failures, depending on what is evaluated.
-
-       Example (notice that ``section_id`` is preserved in the final
-       result) :
-
-       >>> context_str = "{'default_user_id': uid, 'default_section_id': section_id}"
-       >>> eval(context_str, UnquoteEvalContext(uid=1))
-       {'default_user_id': 1, 'default_section_id': section_id}
-
-       """
-    def __init__(self, *args, **kwargs):
-        super(UnquoteEvalContext, self).__init__(None, *args, **kwargs)
-
-    def __missing__(self, key):
-        return unquote(key)
-
-
-class mute_logger(object):
+class mute_logger(logging.Handler):
     """Temporary suppress the logging.
-    Can be used as context manager or decorator.
+
+    Can be used as context manager or decorator::
 
         @mute_logger('odoo.plic.ploc')
         def do_stuff():
@@ -818,23 +796,23 @@ class mute_logger(object):
 
         with mute_logger('odoo.foo.bar'):
             do_suff()
-
     """
     def __init__(self, *loggers):
+        super().__init__()
         self.loggers = loggers
-
-    def filter(self, record):
-        return 0
+        self.old_params = {}
 
     def __enter__(self):
-        for logger in self.loggers:
-            assert isinstance(logger, str),\
-                "A logger name must be a string, got %s" % type(logger)
-            logging.getLogger(logger).addFilter(self)
+        for logger_name in self.loggers:
+            logger = logging.getLogger(logger_name)
+            self.old_params[logger_name] = (logger.handlers, logger.propagate)
+            logger.propagate = False
+            logger.handlers = [self]
 
     def __exit__(self, exc_type=None, exc_val=None, exc_tb=None):
-        for logger in self.loggers:
-            logging.getLogger(logger).removeFilter(self)
+        for logger_name in self.loggers:
+            logger = logging.getLogger(logger_name)
+            logger.handlers, logger.propagate = self.old_params[logger_name]
 
     def __call__(self, func):
         @wraps(func)
@@ -842,6 +820,48 @@ class mute_logger(object):
             with self:
                 return func(*args, **kwargs)
         return deco
+
+    def emit(self, record):
+        pass
+
+
+class lower_logging(logging.Handler):
+    """Temporary lower the max logging level.
+    """
+    def __init__(self, max_level, to_level=None):
+        super().__init__()
+        self.old_handlers = None
+        self.old_propagate = None
+        self.had_error_log = False
+        self.max_level = max_level
+        self.to_level = to_level or max_level
+
+    def __enter__(self):
+        logger = logging.getLogger()
+        self.old_handlers = logger.handlers[:]
+        self.old_propagate = logger.propagate
+        logger.propagate = False
+        logger.handlers = [self]
+        self.had_error_log = False
+        return self
+
+    def __exit__(self, exc_type=None, exc_val=None, exc_tb=None):
+        logger = logging.getLogger()
+        logger.handlers = self.old_handlers
+        logger.propagate = self.old_propagate
+
+    def emit(self, record):
+        if record.levelno > self.max_level:
+            record.levelname = f'_{record.levelname}'
+            record.levelno = self.to_level
+            record.munge_traceback = True
+            self.had_error_log = True
+
+        if logging.getLogger(record.name).isEnabledFor(record.levelno):
+            for handler in self.old_handlers:
+                if handler.level <= record.levelno:
+                    handler.emit(record)
+
 
 _ph = object()
 class CountingStream(object):
@@ -978,7 +998,9 @@ def freehash(arg):
             return id(arg)
 
 def clean_context(context):
-    """ This function take a dictionary and remove each entry with its key starting with 'default_' """
+    """ This function take a dictionary and remove each entry with its key
+    starting with ``default_``
+    """
     return {k: v for k, v in context.items() if not k.startswith('default_')}
 
 
@@ -1124,6 +1146,8 @@ class Callbacks:
     """ A simple queue of callback functions.  Upon run, every function is
     called (in addition order), and the queue is emptied.
 
+    ::
+
         callbacks = Callbacks()
 
         # add foo
@@ -1147,6 +1171,8 @@ class Callbacks:
     store anything, but is mostly aimed at aggregating data for callbacks.  The
     dictionary is automatically cleared by ``run()`` once all callback functions
     have been called.
+
+    ::
 
         # register foo to process aggregated data
         @callbacks.add
@@ -1190,18 +1216,18 @@ class Callbacks:
         self.data.clear()
 
 
-class IterableGenerator:
-    """ An iterable object based on a generator function, which is called each
-        time the object is iterated over.
-    """
-    __slots__ = ['func', 'args']
+class ReversedIterable:
+    """ An iterable implementing the reversal of another iterable. """
+    __slots__ = ['iterable']
 
-    def __init__(self, func, *args):
-        self.func = func
-        self.args = args
+    def __init__(self, iterable):
+        self.iterable = iterable
 
     def __iter__(self):
-        return self.func(*self.args)
+        return reversed(self.iterable)
+
+    def __reversed__(self):
+        return iter(self.iterable)
 
 
 def groupby(iterable, key=None):
@@ -1232,6 +1258,17 @@ def unique(it):
             seen.add(e)
             yield e
 
+def submap(mapping, keys):
+    """
+    Get a filtered copy of the mapping where only some keys are present.
+
+    :param Mapping mapping: the original dict-like structure to filter
+    :param Iterable keys: the list of keys to keep
+    :return dict: a filtered dict copy of the original mapping
+    """
+    keys = frozenset(keys)
+    return {key: mapping[key] for key in mapping if key in keys}
+
 class Reverse(object):
     """ Wraps a value and reverses its ordering, useful in key functions when
     mixing ascending and descending sort on non-numeric data as the
@@ -1250,12 +1287,50 @@ class Reverse(object):
     def __le__(self, other): return self.val >= other.val
     def __lt__(self, other): return self.val > other.val
 
-@contextmanager
 def ignore(*exc):
-    try:
-        yield
-    except exc:
-        pass
+    warnings.warn("Since 16.0 `odoo.tools.ignore` is replaced by `contextlib.suppress`.", DeprecationWarning, stacklevel=2)
+    return contextlib.suppress(*exc)
+
+class replace_exceptions(ContextDecorator):
+    """
+    Hide some exceptions behind another error. Can be used as a function
+    decorator or as a context manager.
+
+    .. code-block:
+
+        @route('/super/secret/route', auth='public')
+        @replace_exceptions(AccessError, by=NotFound())
+        def super_secret_route(self):
+            if not request.session.uid:
+                raise AccessError("Route hidden to non logged-in users")
+            ...
+
+        def some_util():
+            ...
+            with replace_exceptions(ValueError, by=UserError("Invalid argument")):
+                ...
+            ...
+
+    :param exceptions: the exception classes to catch and replace.
+    :param by: the exception to raise instead.
+    """
+    def __init__(self, *exceptions, by):
+        if not exceptions:
+            raise ValueError("Missing exceptions")
+
+        wrong_exc = next((exc for exc in exceptions if not issubclass(exc, Exception)), None)
+        if wrong_exc:
+            raise TypeError(f"{wrong_exc} is not an exception class.")
+
+        self.exceptions = exceptions
+        self.by = by
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is not None and issubclass(exc_type, self.exceptions):
+            raise self.by from exc_value
 
 html_escape = markupsafe.escape
 
@@ -1263,12 +1338,14 @@ def get_lang(env, lang_code=False):
     """
     Retrieve the first lang object installed, by checking the parameter lang_code,
     the context and then the company. If no lang is installed from those variables,
-    fallback on the first lang installed in the system.
+    fallback on english or on the first lang installed in the system.
+
+    :param env:
     :param str lang_code: the locale (i.e. en_US)
     :return res.lang: the first lang found that is installed on the system.
     """
     langs = [code for code, _ in env['res.lang'].get_installed()]
-    lang = langs[0]
+    lang = 'en_US' if 'en_US' in langs else langs[0]
     if lang_code and lang_code in langs:
         lang = lang_code
     elif env.context.get('lang') in langs:
@@ -1342,6 +1419,9 @@ def format_date(env, value, lang_code=False, date_format=False):
             value = odoo.fields.Datetime.context_timestamp(env['res.lang'], value)
         else:
             value = odoo.fields.Datetime.from_string(value)
+    elif isinstance(value, datetime.datetime) and not value.tzinfo:
+        # a datetime, convert to correct timezone
+        value = odoo.fields.Datetime.context_timestamp(env['res.lang'], value)
 
     lang = get_lang(env, lang_code)
     locale = babel_locale_parse(lang.code)
@@ -1373,10 +1453,12 @@ def parse_date(env, value, lang_code=False):
 def format_datetime(env, value, tz=False, dt_format='medium', lang_code=False):
     """ Formats the datetime in a given format.
 
-        :param {str, datetime} value: naive datetime to format either in string or in datetime
-        :param {str} tz: name of the timezone  in which the given datetime should be localized
-        :param {str} dt_format: one of “full”, “long”, “medium”, or “short”, or a custom date/time pattern compatible with `babel` lib
-        :param {str} lang_code: ISO code of the language to use to render the given datetime
+    :param env:
+    :param str|datetime value: naive datetime to format either in string or in datetime
+    :param str tz: name of the timezone  in which the given datetime should be localized
+    :param str dt_format: one of “full”, “long”, “medium”, or “short”, or a custom date/time pattern compatible with `babel` lib
+    :param str lang_code: ISO code of the language to use to render the given datetime
+    :rtype: str
     """
     if not value:
         return ''
@@ -1413,6 +1495,7 @@ def format_datetime(env, value, tz=False, dt_format='medium', lang_code=False):
 def format_time(env, value, tz=False, time_format='medium', lang_code=False):
     """ Format the given time (hour, minute and second) with the current user preference (language, format, ...)
 
+        :param env:
         :param value: the time to format
         :type value: `datetime.time` instance. Could be timezoned to display tzinfo according to format (e.i.: 'full' format)
         :param tz: name of the timezone  in which the given datetime should be localized
@@ -1522,23 +1605,33 @@ def format_duration(value):
         return '-%02d:%02d' % (hours, minutes)
     return '%02d:%02d' % (hours, minutes)
 
+consteq = hmac_lib.compare_digest
 
-def _consteq(str1, str2):
-    """ Constant-time string comparison. Suitable to compare bytestrings of fixed,
-        known length only, because length difference is optimized. """
-    return len(str1) == len(str2) and sum(ord(x)^ord(y) for x, y in zip(str1, str2)) == 0
+_PICKLE_SAFE_NAMES = {
+    'builtins': [
+        'set',  # Required to support `set()` for Python < 3.8
+    ],
+    'datetime': [
+        'datetime',
+        'date',
+        'time',
+    ],
+    'pytz': [
+        '_p',
+        '_UTC',
+    ],
+}
 
-consteq = getattr(passlib.utils, 'consteq', _consteq)
-
+# https://docs.python.org/3/library/pickle.html#restricting-globals
 # forbid globals entirely: str/unicode, int/long, float, bool, tuple, list, dict, None
 class Unpickler(pickle_.Unpickler, object):
-    find_global = None # Python 2
-    find_class = None # Python 3
+    def find_class(self, module_name, name):
+        safe_names = _PICKLE_SAFE_NAMES.get(module_name, [])
+        if name in safe_names:
+            return super().find_class(module_name, name)
+        raise AttributeError("global '%s.%s' is forbidden" % (module_name, name))
 def _pickle_load(stream, encoding='ASCII', errors=False):
-    if sys.version_info[0] == 3:
-        unpickler = Unpickler(stream, encoding=encoding)
-    else:
-        unpickler = Unpickler(stream)
+    unpickler = Unpickler(stream, encoding=encoding)
     try:
         return unpickler.load()
     except Exception:
@@ -1550,6 +1643,7 @@ pickle.load = _pickle_load
 pickle.loads = lambda text, encoding='ASCII': _pickle_load(io.BytesIO(text), encoding=encoding)
 pickle.dump = pickle_.dump
 pickle.dumps = pickle_.dumps
+pickle.HIGHEST_PROTOCOL = pickle_.HIGHEST_PROTOCOL
 
 
 class ReadonlyDict(Mapping):
@@ -1598,16 +1692,17 @@ class DotDict(dict):
         return DotDict(val) if isinstance(val, dict) else val
 
 
-def get_diff(data_from, data_to, custom_style=False):
+def get_diff(data_from, data_to, custom_style=False, dark_color_scheme=False):
     """
     Return, in an HTML table, the diff between two texts.
 
     :param tuple data_from: tuple(text, name), name will be used as table header
     :param tuple data_to: tuple(text, name), name will be used as table header
     :param tuple custom_style: string, style css including <style> tag.
+    :param bool dark_color_scheme: true if dark color scheme is used
     :return: a string containing the diff in an HTML table format.
     """
-    def handle_style(html_diff, custom_style):
+    def handle_style(html_diff, custom_style, dark_color_scheme):
         """ The HtmlDiff lib will add some useful classes on the DOM to
         identify elements. Simply append to those classes some BS4 ones.
         For the table to fit the modal width, some custom style is needed.
@@ -1619,6 +1714,8 @@ def get_diff(data_from, data_to, custom_style=False):
         for old, new in to_append.items():
             html_diff = html_diff.replace(old, "%s %s" % (old, new))
         html_diff = html_diff.replace('nowrap', '')
+        colors = ('#7f2d2f', '#406a2d', '#51232f', '#3f483b') if dark_color_scheme else (
+            '#ffc1c0', '#abf2bc', '#ffebe9', '#e6ffec')
         html_diff += custom_style or '''
             <style>
                 .modal-dialog.modal-lg:has(table.diff) {
@@ -1626,20 +1723,20 @@ def get_diff(data_from, data_to, custom_style=False):
                     padding-left: 1.75rem;
                     padding-right: 1.75rem;
                 }
-                table.diff { width: 100%; }
-                table.diff th.diff_header { width: 50%; }
+                table.diff { width: 100%%; }
+                table.diff th.diff_header { width: 50%%; }
                 table.diff td.diff_header { white-space: nowrap; }
                 table.diff td { word-break: break-all; vertical-align: top; }
                 table.diff .diff_chg, table.diff .diff_sub, table.diff .diff_add {
                     display: inline-block;
                     color: inherit;
                 }
-                table.diff .diff_sub, table.diff td:nth-child(3) > .diff_chg { background-color: #ffc1c0; }
-                table.diff .diff_add, table.diff td:nth-child(6) > .diff_chg { background-color: #abf2bc; }
-                table.diff td:nth-child(3):has(>.diff_chg, .diff_sub) { background-color: #ffebe9; }
-                table.diff td:nth-child(6):has(>.diff_chg, .diff_add) { background-color: #e6ffec; }
+                table.diff .diff_sub, table.diff td:nth-child(3) > .diff_chg { background-color: %s }
+                table.diff .diff_add, table.diff td:nth-child(6) > .diff_chg { background-color: %s }
+                table.diff td:nth-child(3):has(>.diff_chg, .diff_sub) { background-color: %s }
+                table.diff td:nth-child(6):has(>.diff_chg, .diff_add) { background-color: %s }
             </style>
-        '''
+        ''' % colors
         return html_diff
 
     diff = HtmlDiff(tabsize=2).make_table(
@@ -1650,26 +1747,7 @@ def get_diff(data_from, data_to, custom_style=False):
         context=True,  # Show only diff lines, not all the code
         numlines=3,
     )
-    return handle_style(diff, custom_style)
-
-
-def traverse_containers(val, type_):
-    """ Yields atoms filtered by specified type_ (or type tuple), traverses
-    through standard containers (non-string mappings or sequences) *unless*
-    they're selected by the type filter
-    """
-    from odoo.models import BaseModel
-    if isinstance(val, type_):
-        yield val
-    elif isinstance(val, (str, bytes, BaseModel)):
-        return
-    elif isinstance(val, Mapping):
-        for k, v in val.items():
-            yield from traverse_containers(k, type_)
-            yield from traverse_containers(v, type_)
-    elif isinstance(val, collections.abc.Sequence):
-        for v in val:
-            yield from traverse_containers(v, type_)
+    return handle_style(diff, custom_style, dark_color_scheme)
 
 
 def hmac(env, scope, message, hash_function=hashlib.sha256):
@@ -1691,3 +1769,36 @@ def hmac(env, scope, message, hash_function=hashlib.sha256):
         message.encode(),
         hash_function,
     ).hexdigest()
+
+
+ADDRESS_REGEX = re.compile(r'^(.*?)(\s[0-9][0-9\S]*)?(?: - (.+))?$', flags=re.DOTALL)
+def street_split(street):
+    match = ADDRESS_REGEX.match(street or '')
+    results = match.groups('') if match else ('', '', '')
+    return {
+        'street_name': results[0].strip(),
+        'street_number': results[1].strip(),
+        'street_number2': results[2],
+    }
+
+
+def is_list_of(values, type_):
+    """Return True if the given values is a list / tuple of the given type.
+
+    :param values: The values to check
+    :param type_: The type of the elements in the list / tuple
+    """
+    return isinstance(values, (list, tuple)) and all(isinstance(item, type_) for item in values)
+
+
+def has_list_types(values, types):
+    """Return True if the given values have the same types as
+    the one given in argument, in the same order.
+
+    :param values: The values to check
+    :param types: The types of the elements in the list / tuple
+    """
+    return (
+        isinstance(values, (list, tuple)) and len(values) == len(types)
+        and all(isinstance(item, type_) for item, type_ in zip(values, types))
+    )

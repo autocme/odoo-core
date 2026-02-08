@@ -84,7 +84,7 @@ class TestIrCron(TransactionCase, CronMixinCase):
 
         self.cron.active = False
         self.cron.nextcall = fields.Datetime.now() + timedelta(days=2)
-        self.cron.flush()
+        self.cron.flush_recordset()
         with self.capture_triggers() as capture:
             self.cron._trigger()
 
@@ -105,7 +105,7 @@ class TestIrCron(TransactionCase, CronMixinCase):
         # admin disable the cron
         self.cron.active = False
         self.cron.nextcall = fields.Datetime.now() + timedelta(days=10)
-        self.cron.flush()
+        self.cron.flush_recordset()
 
         # user triggers the cron to run *tomorrow of yesterday (=today)
         with self.capture_triggers() as capture:
@@ -113,7 +113,7 @@ class TestIrCron(TransactionCase, CronMixinCase):
 
         # admin re-enable the cron
         self.cron.active = True
-        self.cron.flush()
+        self.cron.flush_recordset()
 
         # go today, check the cron should run
         self.frozen_datetime.tick(delta=timedelta(days=1))
@@ -126,5 +126,5 @@ class TestIrCron(TransactionCase, CronMixinCase):
         self.cron.interval_number = 0
         with self.assertLogs('odoo.addons.base.models.ir_cron', 'ERROR'):
             self.cron._process_job(get_db_name(), self.env.cr, self.cron.read(load=False)[0])
-        self.cron.invalidate_cache(['active'], self.cron.ids)
+        self.cron.invalidate_recordset(['active'])
         self.assertFalse(self.cron.active)

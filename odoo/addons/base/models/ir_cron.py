@@ -16,7 +16,7 @@ from psycopg2 import sql
 
 _logger = logging.getLogger(__name__)
 
-BASE_VERSION = odoo.modules.load_information_from_description_file('base')['version']
+BASE_VERSION = odoo.modules.get_manifest('base')['version']
 MAX_FAIL_TIME = timedelta(hours=5)  # chosen with a fair roll of the dice
 
 # custom function to call instead of NOTIFY postgresql command (opt-in)
@@ -59,7 +59,7 @@ class ir_cron(models.Model):
     cron_name = fields.Char('Name', related='ir_actions_server_id.name', store=True, readonly=False)
     user_id = fields.Many2one('res.users', string='Scheduler User', default=lambda self: self.env.user, required=True)
     active = fields.Boolean(default=True)
-    interval_number = fields.Integer(default=1, help="Repeat every x.")
+    interval_number = fields.Integer(default=1, group_operator=None, help="Repeat every x.")
     interval_type = fields.Selection([('minutes', 'Minutes'),
                                       ('hours', 'Hours'),
                                       ('days', 'Days'),
@@ -69,14 +69,15 @@ class ir_cron(models.Model):
     doall = fields.Boolean(string='Repeat Missed', help="Specify if missed occurrences should be executed when the server restarts.")
     nextcall = fields.Datetime(string='Next Execution Date', required=True, default=fields.Datetime.now, help="Next planned execution date for this job.")
     lastcall = fields.Datetime(string='Last Execution Date', help="Previous time the cron ran successfully, provided to the job through the context on the `lastcall` key")
-    priority = fields.Integer(default=5, help='The priority of the job, as an integer: 0 means higher priority, 10 means lower priority.')
+    priority = fields.Integer(default=5, group_operator=None, help='The priority of the job, as an integer: 0 means higher priority, 10 means lower priority.')
 
-    @api.model
-    def create(self, values):
-        values['usage'] = 'ir_cron'
+    @api.model_create_multi
+    def create(self, vals_list):
+        for vals in vals_list:
+            vals['usage'] = 'ir_cron'
         if os.getenv('ODOO_NOTIFY_CRON_CHANGES'):
             self._cr.postcommit.add(self._notifydb)
-        return super(ir_cron, self).create(values)
+        return super().create(vals_list)
 
     @api.model
     def default_get(self, fields_list):
@@ -85,9 +86,9 @@ class ir_cron(models.Model):
             self = self.with_context(default_state='code')
         return super(ir_cron, self).default_get(fields_list)
 
-    @api.onchange('active', 'interval_number')
+    @api.onchange('active', 'interval_number', 'interval_type')
     def _onchange_interval_number(self):
-        if self.active and self.interval_number <= 0:
+        if self.active and (self.interval_number <= 0 or not self.interval_type):
             self.active = False
             return {'warning': {
                 'title': _("Scheduled action disabled"),
@@ -99,8 +100,8 @@ class ir_cron(models.Model):
         for cron in self:
             cron._try_lock()
             _logger.info('Manually starting job `%s`.', cron.name)
-            cron.with_user(cron.user_id).with_context(lastcall=cron.lastcall).ir_actions_server_id.run()
-            cron.flush()
+            cron.with_user(cron.user_id).with_context({'lastcall': cron.lastcall}).ir_actions_server_id.run()
+            self.env.flush_all()
             _logger.info('Job `%s` done.', cron.name)
             cron.lastcall = fields.Datetime.now()
         return True
@@ -198,7 +199,7 @@ class ir_cron(models.Model):
     def _get_all_ready_jobs(cls, cr):
         """ Return a list of all jobs that are ready to be executed """
         cr.execute("""
-            SELECT *
+            SELECT *, cron_name->>'en_US' as cron_name
             FROM ir_cron
             WHERE active = true
               AND numbercall != 0
@@ -260,7 +261,7 @@ class ir_cron(models.Model):
         # Learn more: https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-ROWS
 
         query = """
-            SELECT *
+            SELECT *, cron_name->>'en_US' as cron_name
             FROM ir_cron
             WHERE active = true
               AND numbercall != 0
@@ -388,7 +389,7 @@ class ir_cron(models.Model):
             if _logger.isEnabledFor(logging.DEBUG):
                 start_time = time.time()
             self.env['ir.actions.server'].browse(server_action_id).run()
-            self.env['ir.actions.server'].flush()
+            self.env.flush_all()
             _logger.info('Job `%s` done.', cron_name)
             if start_time and _logger.isEnabledFor(logging.DEBUG):
                 end_time = time.time()
@@ -465,7 +466,6 @@ class ir_cron(models.Model):
         active = bool(self.env[model].search_count(domain))
         return self.try_write({'active': active})
 
-    @api.model
     def _trigger(self, at=None):
         """
         Schedule a cron job to be executed soon independently of its
@@ -493,7 +493,6 @@ class ir_cron(models.Model):
 
         self._trigger_list(at_list)
 
-    @api.model
     def _trigger_list(self, at_list):
         """
         Implementation of :meth:`~._trigger`.
@@ -546,4 +545,8 @@ class ir_cron_trigger(models.Model):
 
     @api.autovacuum
     def _gc_cron_triggers(self):
-        self.search([('call_at', '<', datetime.now() + relativedelta(weeks=-1))]).unlink()
+        domain = [('call_at', '<', datetime.now() + relativedelta(weeks=-1))]
+        records = self.search(domain, limit=models.GC_UNLINK_LIMIT)
+        if len(records) >= models.GC_UNLINK_LIMIT:
+            self.env.ref('base.autovacuum_job')._trigger()
+        return records.unlink()

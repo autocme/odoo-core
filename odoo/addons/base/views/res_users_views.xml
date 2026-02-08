@@ -1,6 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
 <odoo>
     <data>
+        <record id="change_password_own_form" model="ir.ui.view">
+            <field name="name">Change Own Password</field>
+            <field name="model">change.password.own</field>
+            <field name="arch" type="xml">
+                <form string="Change Password">
+                    <group>
+                        <field name="new_password" password="True" required="1"/>
+                        <field name="confirm_password" password="True" required="1"/>
+                    </group>
+                    <footer>
+                        <button string="Change Password" name="change_password" type="object" class="btn-primary" data-hotkey="q"/>
+                        <button string="Cancel" class="btn-secondary" special="cancel" data-hotkey="z" />
+                    </footer>
+                </form>
+            </field>
+        </record>
 
         <!-- change password wizard -->
         <record id="change_password_wizard_view" model="ir.ui.view">
@@ -24,7 +40,7 @@
                 <tree string="Users" editable="bottom" create="false" delete="false">
                     <field name="user_id" invisible="1"/>
                     <field name="user_login"  force_save="1"/>
-                    <field name="new_passwd" required="True" password="True"/>
+                    <field name="new_passwd" required="True" password="True" width="20px"/>
                 </tree>
             </field>
         </record>
@@ -40,11 +56,12 @@
             <field name="model">res.users.identitycheck</field>
             <field name="arch" type="xml">
                 <form string="Password Confirmation">
-                    <sheet clas="bg-primary">
+                    <sheet class="bg-primary">
                         <h3><strong>Please enter your password to confirm you own this account</strong></h3>
                         <br/>
                         <div>
-                            <field class="col-10 col-md-6 px-0" name="password" autocomplete="current-password" required="True" password="True"/>
+                            <field class="o_field_highlight col-10 col-md-6 px-0" name="password" autocomplete="current-password"
+                                required="True" password="True" placeholder="************"/>
                         </div>
                         <a href="/web/reset_password/" class="btn btn-link" role="button">Forgot password?</a>
                     </sheet>
@@ -65,7 +82,7 @@
                     <field name="name" filter_domain="['|', ('full_name','ilike',self), ('category_id','ilike',self)]" string="Group"/>
                     <separator orientation="vertical"/>
                     <field name="share"/>
-                    <filter name="no_share" string="Internal Groups" domain="[('share','=',False)]"/>
+                    <filter name="filter_no_share" string="Internal Groups" domain="[('share','=',False)]"/>
                 </search>
             </field>
         </record>
@@ -82,7 +99,7 @@
                     </group>
                     <notebook>
                         <page string="Users" name="users">
-                            <field name="users" context="{'search_default_no_share':1}"/>
+                            <field name="users" context="{'search_default_filter_no_share':1}"/>
                         </page>
                         <page string="Inherited" name="inherit_groups">
                             <label for="implied_ids" string="Users added to this group are automatically added in the following groups."/>
@@ -130,7 +147,7 @@
             <field name="name">Groups</field>
             <field name="type">ir.actions.act_window</field>
             <field name="res_model">res.groups</field>
-            <field name="context">{'search_default_no_share': 1}</field>
+            <field name="context">{'search_default_filter_no_share': 1}</field>
             <field name="help">A group is a set of functional areas that will be assigned to the user in order to give them access and rights to specific applications and tasks in the system. You can create custom groups or edit the ones existing by default in order to customize the view of the menu that users will be able to see. Whether they can have a read, write, create and delete access right can be managed from here.</field>
         </record>
         <menuitem action="action_res_groups" id="menu_action_res_groups" parent="base.menu_users" groups="base.group_no_one" sequence="3"/>
@@ -167,8 +184,8 @@
                             <div attrs="{'invisible': [('id', '>', 0)]}" groups="base.group_no_one">
                                 <field name="groups_id" readonly="1" widget="many2many_tags" options="{'color_field': 'color'}" style="display: inline;"/> You will be able to define additional access rights by editing the newly created user under the Settings / Users menu.
                             </div>
-                            <field name="phone" widget="phone" options="{'enable_sms': false}"/>
-                            <field name="mobile" widget="phone" options="{'enable_sms': false}"/>
+                            <field name="phone" widget="phone"/>
+                            <field name="mobile" widget="phone"/>
                         </group>
                     </sheet>
                 </form>
@@ -204,7 +221,7 @@
                                 '&amp;', ('active', '=', True), ('active_partner', '=', False),
                             ]}"
                             role="alert">
-                          <a class="close" data-dismiss="alert" href="#">x</a>
+                          <a class="close" data-bs-dismiss="alert" href="#">x</a>
                           <div>
                             <strong>The contact linked to this user is still active</strong>
                           </div>
@@ -223,6 +240,7 @@
                             <group>
                                 <field name="partner_id" readonly="1" required="0" groups="base.group_no_one"
                                         attrs="{'invisible': [('id', '=', False)]}"/>
+                                <field name="share" invisible="1"/>
                             </group>
                         </div>
                         <notebook colspan="4">
@@ -243,15 +261,16 @@
                                             <field name="lang" required="1"/>
                                             <button
                                                 type="action"
-                                                name="%(base.res_lang_act_window)d"
-                                                class="btn-sm btn-link mb4 fa fa-globe"
-                                                aria-label="More languages"
-                                                title="More languages"/>
+                                                name="%(base.action_view_base_language_install)d"
+                                                class="oe_edit_only btn-sm btn-link mb4 fa fa-globe"
+                                                aria-label="Add a language"
+                                                title="Add a language"/>
                                         </div>
                                         <field name="tz" widget="timezone_mismatch" options="{'tz_offset_field': 'tz_offset'}" />
                                         <field name="tz_offset" invisible="1"/>
                                     </group>
-                                    <group string="Menus Customization" groups="base.group_no_one">
+                                    <group string="Menus Customization" groups="base.group_no_one"
+                                        attrs="{'invisible': [('share', '=', True)]}">
                                         <field name="action_id"/>
                                     </group>
                                 </group>
@@ -297,12 +316,12 @@
                                 </div>
                                 <div class="oe_kanban_details">
                                     <ul>
-                                        <li class="text-success float-right mb4" t-if="record.active.raw_value"><i class="fa fa-circle" role="img" aria-label="Ok" title="Ok"></i></li>
-                                        <li class="text-danger float-right mb4" t-if="!record.active.raw_value"><i class="fa fa-circle" role="img" aria-label="Invalid" title="Invalid"></i></li>
+                                        <li class="text-success float-end mb4" t-if="record.active.raw_value"><i class="fa fa-circle" role="img" aria-label="Ok" title="Ok"></i></li>
+                                        <li class="text-danger float-end mb4" t-if="!record.active.raw_value"><i class="fa fa-circle" role="img" aria-label="Invalid" title="Invalid"></i></li>
                                         <li class="mb4">
                                             <strong><field name="name"/></strong>
                                         </li>
-                                        <li class="badge badge-pill float-right mb4" t-if="record.lang.raw_value"><field name="lang"/></li>
+                                        <li class="badge rounded-pill float-end mb4" t-if="record.lang.raw_value"><field name="lang"/></li>
                                         <li class="mb4" t-if="record.login.raw_value" title="Login"><i class="fa fa-envelope" role="img" aria-label="Login"/> <field name="login"/></li>
                                     </ul>
                                 </div>
@@ -320,7 +339,8 @@
                     <field name="name" filter_domain="['|', '|', ('name','ilike',self), ('login','ilike',self), ('email','ilike',self)]" string="User"/>
                     <field name="company_ids" string="Company" groups="base.group_multi_company"/>
                     <field name="share"/>
-                    <filter name="no_share" string="Internal Users" domain="[('share','=',False)]"/>
+                    <filter name="filter_no_share" string="Internal Users" domain="[('share', '=', False)]"/>
+                    <filter name="filter_share" string="Portal Users" domain="[('share', '=', True)]"/>
                     <separator/>
                     <filter name="Inactive" string="Inactive Users" domain="[('active','=',False)]"/>
                 </search>
@@ -344,7 +364,7 @@
             <field name="view_mode">tree,kanban,form</field>
             <field name="view_id" ref="view_users_tree"/>
             <field name="search_view_id" ref="view_users_search"/>
-            <field name="context">{'search_default_no_share': 1}</field>
+            <field name="context">{'search_default_filter_no_share': 1, 'show_user_group_warning': True}</field>
             <field name="help">Create and manage users that will connect to the system. Users can be deactivated should there be a period of time during which they will/should not connect to the system. You can assign them groups in order to give them specific access to the applications they need to use in the system.</field>
         </record>
         <record id="action_res_users_view1" model="ir.actions.act_window.view">
@@ -374,7 +394,7 @@
             <field name="arch" type="xml">
                 <form>
                     <sheet>
-                    <h3 class="font-weight-bold">
+                    <h3 class="fw-bold">
                         Name your key
                     </h3>
                     <p>Enter a description of and purpose for the key.</p>
@@ -399,7 +419,7 @@
             <field name="arch" type="xml">
                 <form>
                     <sheet>
-                        <h3 class="font-weight-bold">
+                        <h3 class="fw-bold">
                             Write down your key
                         </h3>
                         <p>
@@ -425,7 +445,7 @@
             <field name="model">res.users</field>
             <field eval="18" name="priority"/>
             <field name="arch" type="xml">
-                <form string="Users">
+                <form string="Users" edit="1">
                     <field name="avatar_128" invisible="1"/>
                     <field name="image_1920" readonly="0" widget='image' class="oe_right oe_avatar" options='{"preview_image": "avatar_128"}'/>
                     <h1>
@@ -443,16 +463,17 @@
                                         <field name="lang" required="1" readonly="0"/>
                                         <button
                                             type="action"
-                                            name="%(base.res_lang_act_window)d"
-                                            class="btn-sm btn-link mb4 fa fa-globe"
-                                            aria-label="More languages"
+                                            name="%(base.action_view_base_language_install)d"
+                                            class="oe_edit_only btn-sm btn-link mb4 fa fa-globe"
+                                            aria-label="Add a language"
                                             groups="base.group_system"
-                                            title="More languages"
+                                            title="Add a language"
                                         />
                                     </div>
                                     <field name="tz" widget="timezone_mismatch" options="{'tz_offset_field': 'tz_offset'}" readonly="0"/>
                                     <field name="tz_offset" invisible="1"/>
                                 </group>
+                                <field name="share" invisible="1"/>
                             </group>
                             <group name="signature">
                                 <field name="signature" readonly="0" options="{'style-inline': true, 'codeview': true}"/>
@@ -465,14 +486,16 @@
                         </page>
                         <page string="Account Security">
                             <group name="auth" string="Password Management">
-                                <div>
+                                <div colspan="2">
                                     <button name="preference_change_password" type="object" string="Change password" class="btn btn-secondary"/>
                                 </div>
                             </group>
-                            <group groups="base.group_no_one">
-                                <div class="o_horizontal_separator">Developer API Keys
-                                    <a href="https://www.odoo.com/documentation/15.0/developer/misc/api/external_api.html#api-keys" target="_blank">
+                            <group string="API Keys">
+                                <div class="text-muted" colspan="2">
+                                    API Keys are used to connect to Odoo from external tools without the need for a password or Two-factor Authentication.
+                                    <a href="https://www.odoo.com/documentation/16.0/developer/misc/api/external_api.html#api-keys" target="_blank">
                                         <i title="Documentation" class="fa fa-fw o_button_icon fa-info-circle"></i>
+                                        Learn more
                                     </a>
                                 </div>
                                 <div colspan="2" attrs="{'invisible': [('api_key_ids', '=', [])]}">
@@ -481,7 +504,8 @@
                                             <field name="name"/>
                                             <field name="scope"/>
                                             <field name="create_date"/>
-                                            <button type="object" name="remove" icon="fa-trash"/>
+                                            <button type="object" name="remove"
+                                                    string="Delete API key." icon="fa-trash"/>
                                         </tree>
                                     </field>
                                 </div>
@@ -522,7 +546,7 @@
                     <field name="name"/>
                     <field name="scope"/>
                     <field name="create_date"/>
-                    <button type="object" name="remove" icon="fa-trash"/>
+                    <button type="object" name="remove" title="Delete API key." icon="fa-trash"/>
                 </tree>
             </field>
         </record>

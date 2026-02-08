@@ -7,7 +7,7 @@ except ImportError:
     magic = None
 
 from odoo.tests.common import BaseCase
-from odoo.tools.mimetypes import guess_mimetype, get_extension
+from odoo.tools.mimetypes import get_extension, guess_mimetype
 
 PNG = b'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVQI12P4//8/AAX+Av7czFnnAAAAAElFTkSuQmCC'
 GIF = b"R0lGODdhAQABAIAAAP///////ywAAAAAAQABAAACAkQBADs="
@@ -111,14 +111,15 @@ class test_guess_mimetype(BaseCase):
         self.assertEqual(mimetype, 'application/zip')
 
     def test_mimetype_xml(self):
+        expected_mimetype = 'application/xml' if magic is None else 'text/xml'
         mimetype = guess_mimetype(XML, default='test')
-        self.assertEqual(mimetype, 'application/xml')
+        self.assertEqual(mimetype, expected_mimetype)
 
     def test_mimetype_get_extension(self):
         self.assertEqual(get_extension('filename.Abc'), '.abc')
         self.assertEqual(get_extension('filename.scss'), '.scss')
         self.assertEqual(get_extension('filename.torrent'), '.torrent')
-        self.assertEqual(get_extension('.htaccess'), '.htaccess')
+        self.assertEqual(get_extension('.htaccess'), '')
         # enough to suppose that extension is present and don't suffix the filename
         self.assertEqual(get_extension('filename.tar.gz'), '.gz')
         self.assertEqual(get_extension('filename'), '')
@@ -126,8 +127,3 @@ class test_guess_mimetype(BaseCase):
         self.assertEqual(get_extension('filename.not_alnum'), '')
         self.assertEqual(get_extension('filename.with space'), '')
         self.assertEqual(get_extension('filename.notAnExtension'), '')
-
-
-
-if __name__ == '__main__':
-    unittest.main()

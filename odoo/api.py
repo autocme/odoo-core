@@ -28,8 +28,8 @@ try:
 except ImportError:
     from decorator import decorator
 
-from .exceptions import CacheMiss
-from .tools import frozendict, classproperty, lazy_property, StackMap
+from .exceptions import AccessError, CacheMiss
+from .tools import classproperty, frozendict, lazy_property, OrderedSet, Query, StackMap
 from .tools.translate import _
 
 _logger = logging.getLogger(__name__)
@@ -77,10 +77,6 @@ class Meta(type):
             if not key.startswith('__') and callable(value):
                 # make the method inherit from decorators
                 value = propagate(getattr(parent, key, None), value)
-
-                if (getattr(value, '_api', None) or '').startswith('cr'):
-                    _logger.warning("Deprecated method %s.%s in module %s", name, key, attrs.get('__module__'))
-
                 attrs[key] = value
 
         return type.__new__(meta, name, bases, attrs)
@@ -286,7 +282,7 @@ def depends_context(*args):
                     pricelist = self.env['product.pricelist'].browse(product.env.context['pricelist'])
                 else:
                     pricelist = self.env['product.pricelist'].get_default_pricelist()
-                product.price = pricelist.get_products_price(product).get(product.id, 0.0)
+                product.price = pricelist._get_products_price(product).get(product.id, 0.0)
 
     All dependencies must be hashable.  The following keys have special
     support:
@@ -385,6 +381,22 @@ def model(method):
     return method
 
 
+def private(method):
+    """ Decorate a record-style method to indicate that the method cannot be
+        called using RPC. Example::
+
+            @api.private
+            def method(self, args):
+                ...
+
+        If you have business methods that should not be called over RPC, you
+        should prefix them with "_". This decorator may be used in case of
+        existing public methods that become non-RPC callable or for ORM
+        methods.
+    """
+    method._api_private = True
+    return method
+
 _create_logger = logging.getLogger(__name__ + '.create')
 
 
@@ -405,6 +417,7 @@ def model_create_single(method):
             record = model.create(vals)
             records = model.create([vals, ...])
     """
+    _create_logger.warning("The model %s is not overriding the create method in batch", method.__module__)
     wrapper = _model_create_single(method) # pylint: disable=no-value-for-parameter
     wrapper._api = 'model_create'
     return wrapper
@@ -469,21 +482,21 @@ def call_kw(model, name, args, kwargs):
         result = _call_kw_model_create(method, model, args, kwargs)
     else:
         result = _call_kw_multi(method, model, args, kwargs)
-    model.flush()
+    model.env.flush_all()
     return result
 
 
 class Environment(Mapping):
-    """ An environment wraps data for ORM records:
+    """ The environment stores various contextual data used by the ORM:
 
-        - :attr:`cr`, the current database cursor;
-        - :attr:`uid`, the current user id;
-        - :attr:`context`, the current context dictionary;
-        - :attr:`su`, whether in superuser mode.
+    - :attr:`cr`: the current database cursor (for database queries);
+    - :attr:`uid`: the current user id (for access rights checks);
+    - :attr:`context`: the current context dictionary (arbitrary metadata);
+    - :attr:`su`: whether in superuser mode.
 
-        It provides access to the registry by implementing a mapping from model
-        names to new api models. It also holds a cache for records, and a data
-        structure to manage recomputations.
+    It provides access to the registry by implementing a mapping from model
+    names to models. It also holds a cache for records, and a data
+    structure to manage recomputations.
     """
     @classproperty
     def envs(cls):
@@ -506,6 +519,7 @@ class Environment(Mapping):
         self.transaction.reset()
 
     def __new__(cls, cr, uid, context, su=False, uid_origin=None):
+        assert isinstance(cr, BaseCursor)
         if uid == SUPERUSER_ID:
             su = True
 
@@ -527,7 +541,6 @@ class Environment(Mapping):
                 return env
 
         # otherwise create environment, and add it in the set
-        assert isinstance(cr, BaseCursor)
         self = object.__new__(cls)
         self.cr, self.uid, self.context, self.su = self.args = (cr, uid, frozendict(context), su)
         self.uid_origin = uid_origin
@@ -550,7 +563,7 @@ class Environment(Mapping):
 
     def __getitem__(self, model_name):
         """ Return an empty recordset from the given model. """
-        return self.registry[model_name]._browse(self, (), ())
+        return self.registry[model_name](self, (), ())
 
     def __iter__(self):
         """ Return an iterator on model names. """
@@ -572,13 +585,14 @@ class Environment(Mapping):
     def __call__(self, cr=None, user=None, context=None, su=None):
         """ Return an environment based on ``self`` with modified parameters.
 
-            :param cr: optional database cursor to change the current cursor
-            :param user: optional user/user id to change the current user
-            :param context: optional context dictionary to change the current context
-            :param su: optional boolean to change the superuser mode
-            :type context: dict
-            :type user: int or :class:`~odoo.addons.base.models.res_users`
-            :type su: bool
+        :param cr: optional database cursor to change the current cursor
+        :type cursor: :class:`~odoo.sql_db.Cursor`
+        :param user: optional user/user id to change the current user
+        :type user: int or :class:`res.users record<~odoo.addons.base.models.res_users.Users>`
+        :param dict context: optional context dictionary to change the current context
+        :param bool su: optional boolean to change the superuser mode
+        :returns: environment with specified args (new or existing one)
+        :rtype: :class:`Environment`
         """
         cr = self.cr if cr is None else cr
         uid = self.uid if user is None else int(user)
@@ -587,7 +601,13 @@ class Environment(Mapping):
         return Environment(cr, uid, context, su, self.uid_origin)
 
     def ref(self, xml_id, raise_if_not_found=True):
-        """Return the record corresponding to the given ``xml_id``."""
+        """ Return the record corresponding to the given ``xml_id``.
+
+        :param str xml_id: record xml_id, under the format ``<module.id>``
+        :param bool raise_if_not_found: whether the method should raise if record is not found
+        :returns: Found record or None
+        :raise ValueError: if record wasn't found and ``raise_if_not_found`` is True
+        """
         res_model, res_id = self['ir.model.data']._xmlid_to_res_model_res_id(
             xml_id, raise_if_not_found=raise_if_not_found
         )
@@ -619,7 +639,7 @@ class Environment(Mapping):
         """Return the current user (as an instance).
 
         :returns: current user - sudoed
-        :rtype: :class:`~odoo.addons.base.models.res_users`"""
+        :rtype: :class:`res.users record<~odoo.addons.base.models.res_users.Users>`"""
         return self(su=True)['res.users'].browse(self.uid)
 
     @lazy_property
@@ -631,7 +651,7 @@ class Environment(Mapping):
 
         :raise AccessError: invalid or unauthorized `allowed_company_ids` context key content.
         :return: current company (default=`self.user.company_id`), with the current environment
-        :rtype: res.company
+        :rtype: :class:`res.company record<~odoo.addons.base.models.res_company.Company>`
 
         .. warning::
 
@@ -646,8 +666,8 @@ class Environment(Mapping):
         company_ids = self.context.get('allowed_company_ids', [])
         if company_ids:
             if not self.su:
-                user_company_ids = self.user.company_ids.ids
-                if any(cid not in user_company_ids for cid in company_ids):
+                user_company_ids = self.user._get_company_ids()
+                if set(company_ids) - set(user_company_ids):
                     raise AccessError(_("Access to unauthorized or invalid companies."))
             return self['res.company'].browse(company_ids[0])
         return self.user.company_id.with_env(self)
@@ -661,7 +681,7 @@ class Environment(Mapping):
 
         :raise AccessError: invalid or unauthorized `allowed_company_ids` context key content.
         :return: current companies (default=`self.user.company_ids`), with the current environment
-        :rtype: res.company
+        :rtype: :class:`res.company recordset<~odoo.addons.base.models.res_company.Company>`
 
         .. warning::
 
@@ -674,10 +694,10 @@ class Environment(Mapping):
             the targeted company.
         """
         company_ids = self.context.get('allowed_company_ids', [])
+        user_company_ids = self.user._get_company_ids()
         if company_ids:
             if not self.su:
-                user_company_ids = self.user.company_ids.ids
-                if any(cid not in user_company_ids for cid in company_ids):
+                if set(company_ids) - set(user_company_ids):
                     raise AccessError(_("Access to unauthorized or invalid companies."))
             return self['res.company'].browse(company_ids)
         # By setting the default companies to all user companies instead of the main one
@@ -690,7 +710,7 @@ class Environment(Mapping):
         #   - when printing a report for several records from several companies
         #   - when accessing to a record from the notification email template
         #   - when loading an binary image on a template
-        return self.user.company_ids.with_env(self)
+        return self['res.company'].browse(user_company_ids)
 
     @property
     def lang(self):
@@ -698,7 +718,10 @@ class Environment(Mapping):
 
         :rtype: str
         """
-        return self.context.get('lang')
+        lang = self.context.get('lang')
+        # _lang_get_id is cached and used to validate lang before return,
+        # because 'env.lang' may be injected in SQL queries
+        return lang if lang and self['res.lang']._lang_get_id(lang) else None
 
     def clear(self):
         """ Clear all record caches, and discard all fields to recompute.
@@ -717,6 +740,28 @@ class Environment(Mapping):
         )
         return self.cr.savepoint()
 
+    def invalidate_all(self, flush=True):
+        """ Invalidate the cache of all records.
+
+        :param flush: whether pending updates should be flushed before invalidation.
+            It is ``True`` by default, which ensures cache consistency.
+            Do not use this parameter unless you know what you are doing.
+        """
+        if flush:
+            self.flush_all()
+        self.cache.invalidate()
+
+    def _recompute_all(self):
+        """ Process all pending computations. """
+        for field in list(self.fields_to_compute()):
+            self[field.model_name]._recompute_field(field)
+
+    def flush_all(self):
+        """ Flush all pending computations and updates to the database. """
+        self._recompute_all()
+        for model_name in OrderedSet(field.model_name for field in self.cache.get_dirty_fields()):
+            self[model_name].flush_model()
+
     def is_protected(self, field, record):
         """ Return whether `record` is protected against invalidation or
             recomputation for `field`.
@@ -730,18 +775,25 @@ class Environment(Mapping):
     @contextmanager
     def protecting(self, what, records=None):
         """ Prevent the invalidation or recomputation of fields on records.
-            The parameters are either:
-             - ``what`` a collection of fields and ``records`` a recordset, or
-             - ``what`` a collection of pairs ``(fields, records)``.
+        The parameters are either:
+
+        - ``what`` a collection of fields and ``records`` a recordset, or
+        - ``what`` a collection of pairs ``(fields, records)``.
         """
         protected = self._protected
         try:
             protected.pushmap()
-            what = what if records is None else [(what, records)]
-            for fields, records in what:
-                for field in fields:
-                    ids = protected.get(field, frozenset())
-                    protected[field] = ids.union(records._ids)
+            if records is not None:  # Handle first signature
+                ids_by_field = {field: records._ids for field in what}
+            else:  # Handle second signature
+                ids_by_field = defaultdict(list)
+                for fields, what_records in what:
+                    for field in fields:
+                        ids_by_field[field].extend(what_records._ids)
+
+            for field, rec_ids in ids_by_field.items():
+                ids = protected.get(field)
+                protected[field] = ids.union(rec_ids) if ids else frozenset(rec_ids)
             yield
         finally:
             protected.popmap()
@@ -768,6 +820,7 @@ class Environment(Mapping):
         """ Mark ``field`` to be computed on ``records``. """
         if not records:
             return records
+        assert field.store and field.compute, "Cannot add to recompute no-store or no-computed field"
         self.all.tocompute[field].update(records._ids)
 
     def remove_to_compute(self, field, records):
@@ -797,6 +850,8 @@ class Environment(Mapping):
                     return self.company.id
                 elif key == 'uid':
                     return (self.uid, self.su)
+                elif key == 'lang':
+                    return get_context('lang') or None
                 elif key == 'active_test':
                     return get_context('active_test', field.context.get('active_test', True))
                 else:
@@ -830,9 +885,7 @@ class Transaction:
         # fields to protect {field: ids}
         self.protected = StackMap()
         # pending computations {field: ids}
-        self.tocompute = defaultdict(set)
-        # pending updates {model: {id: {field: value}}}
-        self.towrite = defaultdict(lambda: defaultdict(dict))
+        self.tocompute = defaultdict(OrderedSet)
 
     def flush(self):
         """ Flush pending computations and updates in the transaction. """
@@ -843,13 +896,12 @@ class Transaction:
                 if env.uid is not None:
                     break
         if env_to_flush is not None:
-            env_to_flush['base'].flush()
+            env_to_flush.flush_all()
 
     def clear(self):
         """ Clear the caches and pending computations and updates in the translations. """
-        self.cache.invalidate()
+        self.cache.clear()
         self.tocompute.clear()
-        self.towrite.clear()
 
     def reset(self):
         """ Reset the transaction.  This clears the transaction, and reassigns
@@ -869,10 +921,54 @@ EMPTY_DICT = frozendict()
 
 
 class Cache(object):
-    """ Implementation of the cache of records. """
+    """ Implementation of the cache of records.
+
+    For most fields, the cache is simply a mapping from a record and a field to
+    a value.  In the case of context-dependent fields, the mapping also depends
+    on the environment of the given record.  For the sake of performance, the
+    cache is first partitioned by field, then by record.  This makes some
+    common ORM operations pretty fast, like determining which records have a
+    value for a given field, or invalidating a given field on all possible
+    records.
+
+    The cache can also mark some entries as "dirty".  Dirty entries essentially
+    marks values that are different from the database.  They represent database
+    updates that haven't been done yet.  Note that dirty entries only make
+    sense for stored fields.  Note also that if a field is dirty on a given
+    record, and the field is context-dependent, then all the values of the
+    record for that field are considered dirty.  For the sake of consistency,
+    the values that should be in the database must be in a context where all
+    the field's context keys are ``None``.
+    """
+
     def __init__(self):
         # {field: {record_id: value}, field: {context_key: {record_id: value}}}
         self._data = defaultdict(dict)
+
+        # {field: set[id]} stores the fields and ids that are changed in the
+        # cache, but not yet written in the database; their changed values are
+        # in `_data`
+        self._dirty = defaultdict(OrderedSet)
+
+    def __repr__(self):
+        # for debugging: show the cache content and dirty flags as stars
+        data = {}
+        for field, field_cache in sorted(self._data.items(), key=lambda item: str(item[0])):
+            dirty_ids = self._dirty.get(field, ())
+            if field_cache and isinstance(next(iter(field_cache)), tuple):
+                data[field] = {
+                    key: {
+                        Starred(id_) if id_ in dirty_ids else id_: val if field.type != 'binary' else '<binary>'
+                        for id_, val in key_cache.items()
+                    }
+                    for key, key_cache in field_cache.items()
+                }
+            else:
+                data[field] = {
+                    Starred(id_) if id_ in dirty_ids else id_: val if field.type != 'binary' else '<binary>'
+                    for id_, val in field_cache.items()
+                }
+        return repr(data)
 
     def _get_field_cache(self, model, field):
         """ Return the field cache of the given field, but not for modifying it. """
@@ -890,30 +986,145 @@ class Cache(object):
 
     def contains(self, record, field):
         """ Return whether ``record`` has a value for ``field``. """
-        return record.id in self._get_field_cache(record, field)
+        field_cache = self._get_field_cache(record, field)
+        if field.translate:
+            cache_value = field_cache.get(record.id, EMPTY_DICT)
+            if cache_value is None:
+                return True
+            lang = record.env.lang or 'en_US'
+            return lang in cache_value
+
+        return record.id in field_cache
+
+    def contains_field(self, field):
+        """ Return whether ``field`` has a value for at least one record. """
+        cache = self._data.get(field)
+        if not cache:
+            return False
+        # 'cache' keys are tuples if 'field' is context-dependent, record ids otherwise
+        if isinstance(next(iter(cache)), tuple):
+            return any(value for value in cache.values())
+        return True
 
     def get(self, record, field, default=NOTHING):
         """ Return the value of ``field`` for ``record``. """
         try:
             field_cache = self._get_field_cache(record, field)
-            return field_cache[record._ids[0]]
+            cache_value = field_cache[record._ids[0]]
+            if field.translate and cache_value is not None:
+                lang = record.env.lang or 'en_US'
+                return cache_value[lang]
+            return cache_value
         except KeyError:
             if default is NOTHING:
                 raise CacheMiss(record, field)
             return default
 
-    def set(self, record, field, value):
-        """ Set the value of ``field`` for ``record``. """
+    def set(self, record, field, value, dirty=False, check_dirty=True):
+        """ Set the value of ``field`` for ``record``.
+        One can normally make a clean field dirty but not the other way around.
+        Updating a dirty field without ``dirty=True`` is a programming error and
+        raises an exception.
+
+        :param dirty: whether ``field`` must be made dirty on ``record`` after
+            the update
+        :param check_dirty: whether updating a dirty field without making it
+            dirty must raise an exception
+        """
         field_cache = self._set_field_cache(record, field)
+        if field.translate and value is not None:
+            lang = record.env.lang or 'en_US'
+            cache_value = field_cache.get(record._ids[0]) or {}
+            cache_value[lang] = value
+            value = cache_value
         field_cache[record._ids[0]] = value
 
-    def update(self, records, field, values):
-        """ Set the values of ``field`` for several ``records``. """
+        if not check_dirty:
+            return
+        if dirty:
+            assert field.column_type and field.store and record.id
+            self._dirty[field].add(record.id)
+            if record.pool.field_depends_context[field]:
+                # put the values under conventional context key values {'context_key': None},
+                # in order to ease the retrieval of those values to flush them
+                context_none = dict.fromkeys(record.pool.field_depends_context[field])
+                record = record.with_env(record.env(context=context_none))
+                field_cache = self._set_field_cache(record, field)
+                field_cache[record._ids[0]] = value
+        elif record.id in self._dirty.get(field, ()):
+            _logger.error("cache.set() removing flag dirty on %s.%s", record, field.name, stack_info=True)
+
+    def update(self, records, field, values, dirty=False, check_dirty=True):
+        """ Set the values of ``field`` for several ``records``.
+        One can normally make a clean field dirty but not the other way around.
+        Updating a dirty field without ``dirty=True`` is a programming error and
+        raises an exception.
+
+        :param dirty: whether ``field`` must be made dirty on ``record`` after
+            the update
+        :param check_dirty: whether updating a dirty field without making it
+            dirty must raise an exception
+        """
+        if field.translate:
+            lang = records.env.lang or 'en_US'
+            field_cache = self._get_field_cache(records, field)
+            cache_values = []
+            for id_, value in zip(records._ids, values):
+                if value is None:
+                    cache_values.append(None)
+                else:
+                    cache_value = field_cache.get(id_) or {}
+                    cache_value[lang] = value
+                    cache_values.append(cache_value)
+            values = cache_values
+
+        self.update_raw(records, field, values, dirty, check_dirty)
+
+    def update_raw(self, records, field, values, dirty=False, check_dirty=True):
+        """ This is a variant of method :meth:`~update` without the logic for
+        translated fields.
+        """
         field_cache = self._set_field_cache(records, field)
         field_cache.update(zip(records._ids, values))
+        if not check_dirty:
+            return
+        if dirty:
+            assert field.column_type and field.store and all(records._ids)
+            self._dirty[field].update(records._ids)
+            if records.pool.field_depends_context[field]:
+                # put the values under conventional context key values {'context_key': None},
+                # in order to ease the retrieval of those values to flush them
+                context_none = dict.fromkeys(records.pool.field_depends_context[field])
+                records = records.with_env(records.env(context=context_none))
+                field_cache = self._set_field_cache(records, field)
+                field_cache.update(zip(records._ids, values))
+        else:
+            dirty_ids = self._dirty.get(field)
+            if dirty_ids and not dirty_ids.isdisjoint(records._ids):
+                _logger.error("cache.update() removing flag dirty on %s.%s", records, field.name, stack_info=True)
+
+    def insert_missing(self, records, field, values):
+        """ Set the values of ``field`` for the records in ``records`` that
+        don't have a value yet.  In other words, this does not overwrite
+        existing values in cache.
+        """
+        field_cache = self._set_field_cache(records, field)
+        if field.translate:
+            lang = records.env.lang or 'en_US'
+            for id_, val in zip(records._ids, values):
+                if val is None:
+                    field_cache.setdefault(id_, None)
+                else:
+                    cache_value = field_cache.setdefault(id_, {})
+                    if cache_value is not None:
+                        cache_value.setdefault(lang, val)
+        else:
+            for id_, val in zip(records._ids, values):
+                field_cache.setdefault(id_, val)
 
     def remove(self, record, field):
         """ Remove the value of ``field`` for ``record``. """
+        assert record.id not in self._dirty.get(field, ())
         try:
             field_cache = self._set_field_cache(record, field)
             del field_cache[record._ids[0]]
@@ -932,10 +1143,19 @@ class Cache(object):
     def get_until_miss(self, records, field):
         """ Return the cached values of ``field`` for ``records`` until a value is not found. """
         field_cache = self._get_field_cache(records, field)
+        if field.translate:
+            lang = records.env.lang or 'en_US'
+
+            def get_value(id_):
+                cache_value = field_cache[id_]
+                return None if cache_value is None else cache_value[lang]
+        else:
+            get_value = field_cache.__getitem__
+
         vals = []
         for record_id in records._ids:
             try:
-                vals.append(field_cache[record_id])
+                vals.append(get_value(record_id))
             except KeyError:
                 break
         return vals
@@ -943,13 +1163,24 @@ class Cache(object):
     def get_records_different_from(self, records, field, value):
         """ Return the subset of ``records`` that has not ``value`` for ``field``. """
         field_cache = self._get_field_cache(records, field)
+        if field.translate:
+            lang = records.env.lang or 'en_US'
+
+            def get_value(id_):
+                cache_value = field_cache[id_]
+                return None if cache_value is None else cache_value[lang]
+        else:
+            get_value = field_cache.__getitem__
+
         ids = []
         for record_id in records._ids:
             try:
-                val = field_cache[record_id]
+                val = get_value(record_id)
             except KeyError:
                 ids.append(record_id)
             else:
+                if field.type == "monetary":
+                    value = field.convert_to_cache(value, records.browse(record_id))
                 if val != value:
                     ids.append(record_id)
         return records.browse(ids)
@@ -960,20 +1191,78 @@ class Cache(object):
             if name != 'id' and record.id in self._get_field_cache(record, field):
                 yield field
 
-    def get_records(self, model, field):
-        """ Return the records of ``model`` that have a value for ``field``. """
-        field_cache = self._get_field_cache(model, field)
-        return model.browse(field_cache)
+    def get_records(self, model, field, all_contexts=False):
+        """ Return the records of ``model`` that have a value for ``field``.
+        By default the method checks for values in the current context of ``model``.
+        But when ``all_contexts`` is true, it checks for values *in all contexts*.
+        """
+        if all_contexts and model.pool.field_depends_context[field]:
+            field_cache = self._data.get(field, EMPTY_DICT)
+            ids = OrderedSet(id_ for sub_cache in field_cache.values() for id_ in sub_cache)
+        else:
+            ids = self._get_field_cache(model, field)
+        return model.browse(ids)
 
     def get_missing_ids(self, records, field):
         """ Return the ids of ``records`` that have no value for ``field``. """
         field_cache = self._get_field_cache(records, field)
-        for record_id in records._ids:
-            if record_id not in field_cache:
-                yield record_id
+        if field.translate:
+            lang = records.env.lang or 'en_US'
+            for record_id in records._ids:
+                cache_value = field_cache.get(record_id, False)
+                if cache_value is False or not (cache_value is None or lang in cache_value):
+                    yield record_id
+        else:
+            for record_id in records._ids:
+                if record_id not in field_cache:
+                    yield record_id
+
+    def get_dirty_fields(self):
+        """ Return the fields that have dirty records in cache. """
+        return self._dirty.keys()
+
+    def get_dirty_records(self, model, field):
+        """ Return the records that for which ``field`` is dirty in cache. """
+        return model.browse(self._dirty.get(field, ()))
+
+    def has_dirty_fields(self, records, fields=None):
+        """ Return whether any of the given records has dirty fields.
+
+        :param fields: a collection of fields or ``None``; the value ``None`` is
+            interpreted as any field on ``records``
+        """
+        if fields is None:
+            return any(
+                not ids.isdisjoint(records._ids)
+                for field, ids in self._dirty.items()
+                if field.model_name == records._name
+            )
+        else:
+            return any(
+                field in self._dirty and not self._dirty[field].isdisjoint(records._ids)
+                for field in fields
+            )
+
+    def clear_dirty_field(self, field):
+        """ Make the given field clean on all records, and return the ids of the
+        formerly dirty records for the field.
+        """
+        return self._dirty.pop(field, ())
 
     def invalidate(self, spec=None):
-        """ Invalidate the cache, partially or totally depending on ``spec``. """
+        """ Invalidate the cache, partially or totally depending on ``spec``.
+
+        If a field is context-dependent, invalidating it for a given record
+        actually invalidates all the values of that field on the record.  In
+        other words, the field is invalidated for the record in all
+        environments.
+
+        This operation is unsafe by default, and must be used with care.
+        Indeed, invalidating a dirty field on a record may lead to an error,
+        because doing so drops the value to be written in database.
+
+            spec = [(field, ids), (field, None), ...]
+        """
         if spec is None:
             self._data.clear()
         elif spec:
@@ -989,50 +1278,75 @@ class Cache(object):
                     for id_ in ids:
                         field_cache.pop(id_, None)
 
+    def clear(self):
+        """ Invalidate the cache and its dirty flags. """
+        self._data.clear()
+        self._dirty.clear()
+
     def check(self, env):
         """ Check the consistency of the cache for the given environment. """
-        # flush fields to be recomputed before evaluating the cache
-        env['res.partner'].recompute()
-
-        # make a copy of the cache, and invalidate it
-        dump = dict(self._data)
-        self.invalidate()
-
         depends_context = env.registry.field_depends_context
-
-        # re-fetch the records, and compare with their former cache
         invalids = []
 
-        def check(model, field, field_dump):
-            records = env[field.model_name].browse(field_dump)
-            for record in records:
-                if not record.id:
-                    continue
-                try:
-                    cached = field_dump[record.id]
-                    value = field.convert_to_record(cached, record)
-                    fetched = record[field.name]
-                    if fetched != value:
-                        info = {'cached': value, 'fetched': fetched}
-                        invalids.append((record, field, info))
-                except (AccessError, MissingError):
-                    pass
+        def process(model, field, field_cache):
+            # ignore new records and records to flush
+            dirty_ids = self._dirty.get(field, ())
+            ids = [id_ for id_ in field_cache if id_ and id_ not in dirty_ids]
+            if not ids:
+                return
 
-        for field, field_dump in dump.items():
+            # select the column for the given ids
+            query = Query(env.cr, model._table, model._table_query)
+            qname = model._inherits_join_calc(model._table, field.name, query)
+            if field.type == 'binary' and (
+                model.env.context.get('bin_size') or model.env.context.get('bin_size_' + field.name)
+            ):
+                qname = f'pg_size_pretty(length({qname})::bigint)'
+            query.add_where(f'"{model._table}".id IN %s', [tuple(ids)])
+            query_str, params = query.select(f'"{model._table}".id', qname)
+            env.cr.execute(query_str, params)
+
+            # compare returned values with corresponding values in cache
+            for id_, value in env.cr.fetchall():
+                cached = field_cache[id_]
+                if value == cached or (not value and not cached):
+                    continue
+                invalids.append((model.browse(id_), field, {'cached': cached, 'fetched': value}))
+
+        for field, field_cache in self._data.items():
+            # check column fields only
+            if not field.store or not field.column_type or callable(field.translate):
+                continue
+
             model = env[field.model_name]
             if depends_context[field]:
-                for context_keys, field_cache in field_dump.items():
+                for context_keys, inner_cache in field_cache.items():
                     context = dict(zip(depends_context[field], context_keys))
-                    check(model.with_context(context), field, field_cache)
+                    if 'company' in context:
+                        # the cache key 'company' actually comes from context
+                        # key 'allowed_company_ids' (see property env.company
+                        # and method env.cache_key())
+                        context['allowed_company_ids'] = [context.pop('company')]
+                    process(model.with_context(context), field, inner_cache)
             else:
-                check(model, field, field_dump)
+                process(model, field, field_cache)
 
         if invalids:
-            raise UserError('Invalid cache for fields\n' + pformat(invalids))
+            _logger.warning("Invalid cache: %s", pformat(invalids))
+
+
+class Starred:
+    """ Simple helper class to ``repr`` a value with a star suffix. """
+    __slots__ = ['value']
+
+    def __init__(self, value):
+        self.value = value
+
+    def __repr__(self):
+        return f"{self.value!r}*"
 
 
 # keep those imports here in order to handle cyclic dependencies correctly
 from odoo import SUPERUSER_ID
-from odoo.exceptions import UserError, AccessError, MissingError
 from odoo.modules.registry import Registry
 from .sql_db import BaseCursor

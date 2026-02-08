@@ -1,6 +1,7 @@
-# -*- coding: utf-8 -*-
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
+
 import base64
+import contextlib
 import hashlib
 import io
 import itertools
@@ -14,8 +15,8 @@ from collections import defaultdict
 from PIL import Image
 
 from odoo import api, fields, models, SUPERUSER_ID, tools, _
-from odoo.exceptions import AccessError, ValidationError, MissingError, UserError
-from odoo.tools import config, human_size, ustr, html_escape, ImageProcess, str2bool
+from odoo.exceptions import AccessError, ValidationError, UserError
+from odoo.tools import config, human_size, ImageProcess, str2bool, consteq
 from odoo.tools.mimetypes import guess_mimetype
 from odoo.osv import expression
 
@@ -109,7 +110,7 @@ class IrAttachment(models.Model):
             os.makedirs(dirname)
         # prevent sha-1 collision
         if os.path.isfile(full_path) and not self._same_content(bin_data, full_path):
-            raise UserError("The attachment is colliding with an existing file.")
+            raise UserError(_("The attachment collides with an existing file."))
         return fname, full_path
 
     @api.model
@@ -151,7 +152,7 @@ class IrAttachment(models.Model):
         if not os.path.exists(full_path):
             dirname = os.path.dirname(full_path)
             if not os.path.isdir(dirname):
-                with tools.ignore(OSError):
+                with contextlib.suppress(OSError):
                     os.makedirs(dirname)
             open(full_path, 'ab').close()
 
@@ -178,6 +179,12 @@ class IrAttachment(models.Model):
         cr.execute("SET LOCAL lock_timeout TO '10s'")
         cr.execute("LOCK ir_attachment IN SHARE MODE")
 
+        self._gc_file_store_unsafe()
+
+        # commit to release the lock
+        cr.commit()
+
+    def _gc_file_store_unsafe(self):
         # retrieve the file names from the checklist
         checklist = {}
         for dirpath, _, filenames in os.walk(self._full_path('checklist')):
@@ -189,10 +196,10 @@ class IrAttachment(models.Model):
         # Clean up the checklist. The checklist is split in chunks and files are garbage-collected
         # for each chunk.
         removed = 0
-        for names in cr.split_for_in_conditions(checklist):
+        for names in self.env.cr.split_for_in_conditions(checklist):
             # determine which files to keep among the checklist
-            cr.execute("SELECT store_fname FROM ir_attachment WHERE store_fname IN %s", [names])
-            whitelist = set(row[0] for row in cr.fetchall())
+            self.env.cr.execute("SELECT store_fname FROM ir_attachment WHERE store_fname IN %s", [names])
+            whitelist = set(row[0] for row in self.env.cr.fetchall())
 
             # remove garbage files, and clean up checklist
             for fname in names:
@@ -204,11 +211,9 @@ class IrAttachment(models.Model):
                         removed += 1
                     except (OSError, IOError):
                         _logger.info("_file_gc could not unlink %s", self._full_path(fname), exc_info=True)
-                with tools.ignore(OSError):
+                with contextlib.suppress(OSError):
                     os.unlink(filepath)
 
-        # commit to release the lock
-        cr.commit()
         _logger.info("filestore gc %d checked, %d removed", len(checklist), removed)
 
     @api.depends('store_fname', 'db_datas', 'file_size')
@@ -324,26 +329,26 @@ class IrAttachment(models.Model):
             max_resolution = ICP('base.image_autoresize_max_px', '1920x1920')
             if str2bool(max_resolution, True):
                 try:
-                    img = fn_quality = False
+                    img = False
                     if is_raw:
-                        img = ImageProcess(False, verify_resolution=False)
-                        img.image = Image.open(io.BytesIO(values['raw']))
-                        img.original_format = (img.image.format or '').upper()
+                        img = ImageProcess(values['raw'], verify_resolution=False)
                     else:  # datas
-                        img = ImageProcess(values['datas'], verify_resolution=False)
+                        img = ImageProcess(base64.b64decode(values['datas']), verify_resolution=False)
 
                     w, h = img.image.size
                     nw, nh = map(int, max_resolution.split('x'))
                     if w > nw or h > nh:
                         img = img.resize(nw, nh)
                         quality = int(ICP('base.image_autoresize_quality', 80))
-                        fn_quality = img.image_quality if is_raw else img.image_base64
-                        values[is_raw and 'raw' or 'datas'] = fn_quality(quality=quality)
+                        image_data = img.image_quality(quality=quality)
+                        if is_raw:
+                            values['raw'] = image_data
+                        else:
+                            values['datas'] = base64.b64encode(image_data)
                 except UserError as e:
                     # Catch error during test where we provide fake image
                     # raise UserError(_("This file could not be decoded as an image file. Please try with a different file."))
                     _logger.info('Post processing ignored : %s', e)
-                    pass
         return values
 
     def _check_contents(self, values):
@@ -390,16 +395,16 @@ class IrAttachment(models.Model):
     name = fields.Char('Name', required=True)
     description = fields.Text('Description')
     res_name = fields.Char('Resource Name', compute='_compute_res_name')
-    res_model = fields.Char('Resource Model', readonly=True, help="The database object this attachment will be attached to.")
+    res_model = fields.Char('Resource Model', readonly=True)
     res_field = fields.Char('Resource Field', readonly=True)
     res_id = fields.Many2oneReference('Resource ID', model_field='res_model',
-                                      readonly=True, help="The record id this is attached to.")
+                                      readonly=True)
     company_id = fields.Many2one('res.company', string='Company', change_default=True,
                                  default=lambda self: self.env.company)
     type = fields.Selection([('url', 'URL'), ('binary', 'File')],
                             string='Type', required=True, default='binary', change_default=True,
                             help="You can either upload a file from your computer or copy/paste an internet link to your file.")
-    url = fields.Char('Url', index=True, size=1024)
+    url = fields.Char('Url', index='btree_not_null', size=1024)
     public = fields.Boolean('Is public document')
 
     # for external access
@@ -409,7 +414,7 @@ class IrAttachment(models.Model):
     raw = fields.Binary(string="File Content (raw)", compute='_compute_raw', inverse='_inverse_raw')
     datas = fields.Binary(string='File Content (base64)', compute='_compute_datas', inverse='_inverse_datas')
     db_datas = fields.Binary('Database Data', attachment=False)
-    store_fname = fields.Char('Stored Filename')
+    store_fname = fields.Char('Stored Filename', index=True, unaccent=False)
     file_size = fields.Integer('File Size', readonly=True)
     checksum = fields.Char("Checksum/SHA1", size=40, index=True, readonly=True)
     mimetype = fields.Char('Mime Type', readonly=True)
@@ -433,7 +438,7 @@ class IrAttachment(models.Model):
             if attachment.type == 'binary' and attachment.url:
                 has_group = self.env.user.has_group
                 if not any(has_group(g) for g in attachment.get_serving_groups()):
-                    raise ValidationError("Sorry, you are not allowed to write on this document")
+                    raise ValidationError(_("Sorry, you are not allowed to write on this document"))
 
     @api.model
     def check(self, mode, values=None):
@@ -441,13 +446,13 @@ class IrAttachment(models.Model):
         if self.env.is_superuser():
             return True
         # Always require an internal user (aka, employee) to access to a attachment
-        if not (self.env.is_admin() or self.env.user.has_group('base.group_user')):
+        if not (self.env.is_admin() or self.env.user._is_internal()):
             raise AccessError(_("Sorry, you are not allowed to access this document."))
         # collect the records to check (by model)
         model_ids = defaultdict(set)            # {model_name: set(ids)}
         if self:
             # DLE P173: `test_01_portal_attachment`
-            self.env['ir.attachment'].flush(['res_model', 'res_id', 'create_uid', 'public', 'res_field'])
+            self.env['ir.attachment'].flush_model(['res_model', 'res_id', 'create_uid', 'public', 'res_field'])
             self._cr.execute('SELECT res_model, res_id, create_uid, public, res_field FROM ir_attachment WHERE id IN %s', [tuple(self.ids)])
             for res_model, res_id, create_uid, public, res_field in self._cr.fetchall():
                 if public and mode == 'read':
@@ -479,6 +484,27 @@ class IrAttachment(models.Model):
             records.check_access_rights(access_mode)
             records.check_access_rule(access_mode)
 
+    @api.model
+    def _filter_attachment_access(self, attachment_ids):
+        """Filter the given attachment to return only the records the current user have access to.
+
+        :param attachment_ids: List of attachment ids we want to filter
+        :return: <ir.attachment> the current user have access to
+        """
+        ret_attachments = self.env['ir.attachment']
+        attachments = self.browse(attachment_ids)
+        if not attachments.check_access_rights('read', raise_exception=False):
+            return ret_attachments
+
+        for attachment in attachments.sudo():
+            # Use SUDO here to not raise an error during the prefetch
+            # And then drop SUDO right to check if we can access it
+            try:
+                attachment.sudo(False).check('read')
+                ret_attachments |= attachment
+            except AccessError:
+                continue
+        return ret_attachments
 
     def _read_group_allowed_fields(self):
         return ['type', 'company_id', 'res_id', 'create_date', 'create_uid', 'name', 'mimetype', 'id', 'url', 'res_field', 'res_model']
@@ -570,7 +596,7 @@ class IrAttachment(models.Model):
         if len(orig_ids) == limit and len(result) < self._context.get('need', limit):
             need = self._context.get('need', limit) - len(result)
             result.extend(self.with_context(need=need)._search(args, offset=offset + len(orig_ids),
-                                       limit=limit, order=order, count=count,
+                                       limit=limit, order=order, count=False,
                                        access_rights_uid=access_rights_uid)[:limit - len(result)])
 
         return len(result) if count else list(result)
@@ -644,7 +670,7 @@ class IrAttachment(models.Model):
         Attachments = self.browse()
         for res_model, res_id in record_tuple_set:
             Attachments.check('create', values={'res_model':res_model, 'res_id':res_id})
-        return super(IrAttachment, self).create(vals_list)
+        return super().create(vals_list)
 
     def _post_add_create(self):
         pass
@@ -663,15 +689,36 @@ class IrAttachment(models.Model):
     def _generate_access_token(self):
         return str(uuid.uuid4())
 
+    def validate_access(self, access_token):
+        self.ensure_one()
+        record_sudo = self.sudo()
+
+        if access_token:
+            tok = record_sudo.with_context(prefetch_fields=False).access_token
+            valid_token = consteq(tok or '', access_token)
+            if not valid_token:
+                raise AccessError("Invalid access token")
+            return record_sudo
+
+        if record_sudo.with_context(prefetch_fields=False).public:
+            return record_sudo
+
+        if self.env.user.has_group('base.group_portal'):
+            # Check the read access on the record linked to the attachment
+            # eg: Allow to download an attachment on a task from /my/tasks/task_id
+            self.check('read')
+            return record_sudo
+
+        return self
+
     @api.model
     def action_get(self):
         return self.env['ir.actions.act_window']._for_xml_id('base.action_attachment')
 
     @api.model
-    def get_serve_attachment(self, url, extra_domain=None, extra_fields=None, order=None):
+    def _get_serve_attachment(self, url, extra_domain=None, order=None):
         domain = [('type', '=', 'binary'), ('url', '=', url)] + (extra_domain or [])
-        fieldNames = ['__last_update', 'datas', 'mimetype'] + (extra_fields or [])
-        return self.search_read(domain, fieldNames, order=order, limit=1)
+        return self.search(domain, order=order, limit=1)
 
     @api.model
     def regenerate_assets_bundles(self):

@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 
-from odoo import api, fields, models
+from odoo import api, fields, models, _
 
-
-def selection_fn(model):
-    return [(str(key), val) for key, val in enumerate(["Corge", "Grault", "Wheee", "Moog"])]
+def selection_fn(self):
+    return [
+        (str(key), val)
+        for key, val in enumerate([_("Corge"), _("Grault"), _("Wheee"), _("Moog")])
+    ]
 
 def compute_fn(records):
     for record in records:
@@ -184,3 +186,14 @@ class ChidToString(models.Model):
     _name = _description = 'export.m2o.str.child'
 
     name = fields.Char()
+
+class WithRequiredField(models.Model):
+    _name = _description = 'export.with.required.field'
+
+    name = fields.Char()
+    value = fields.Integer(required=True)
+
+class Many2OneRequiredSubfield(models.Model):
+    _name = _description = 'export.many2one.required.subfield'
+
+    name = fields.Many2one('export.with.required.field')

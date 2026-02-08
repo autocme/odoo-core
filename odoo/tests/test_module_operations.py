@@ -3,6 +3,7 @@ import argparse
 import logging.config
 import os
 import sys
+import threading
 import time
 
 sys.path.append(os.path.abspath(os.path.join(__file__,'../../../')))
@@ -17,10 +18,13 @@ _logger = logging.getLogger('odoo.tests.test_module_operations')
 
 BLACKLIST = {
     'auth_ldap', 'document_ftp', 'website_instantclick', 'pad',
-    'pad_project', 'note_pad', 'pos_cache', 'pos_blackbox_be', 'payment_test',
+    'pad_project', 'note_pad', 'pos_cache', 'pos_blackbox_be',
 }
-IGNORE = ('hw_', 'theme_', 'l10n_', 'test_', 'payment_')
+IGNORE = ('hw_', 'theme_', 'l10n_', 'test_')
 
+INSTALL_BLACKLIST = {
+    'payment_alipay', 'payment_ogone', 'payment_payulatam', 'payment_payumoney',
+}  # deprecated modules (cannot be installed manually through button_install anymore)
 
 def install(db_name, module_id, module_name):
     with odoo.registry(db_name).cursor() as cr:
@@ -126,6 +130,7 @@ def test_cycle(args):
         def valid(module):
             return not (
                 module.name in BLACKLIST
+                or module.name in INSTALL_BLACKLIST
                 or module.name.startswith(IGNORE)
                 or module.state in ('installed', 'uninstallable')
             )
@@ -161,7 +166,7 @@ def test_uninstall(args):
 
         if module_state == 'installed':
             uninstall(args.database, module_id, module_name)
-            if args.reinstall:
+            if args.reinstall and module_name not in INSTALL_BLACKLIST:
                 install(args.database, module_id, module_name)
         elif module_state:
             _logger.warning("Module %r is not installed", module_name)
@@ -171,6 +176,7 @@ def test_uninstall(args):
 
 def test_standalone(args):
     """ Tries to launch standalone scripts tagged with @post_testing """
+    odoo.service.db._check_faketime_mode(args.database)  # noqa: SLF001
     # load the registry once for script discovery
     registry = odoo.registry(args.database)
     for module_name in registry._init_modules:
@@ -195,12 +201,13 @@ def test_standalone(args):
             except Exception:
                 _logger.error("Standalone script %s failed", func.__name__, exc_info=True)
 
-    _logger.info("%d standalone scripts executed in %.2fs" % (len(funcs), time.time() - start_time))
+    _logger.info("%d standalone scripts executed in %.2fs", len(funcs), time.time() - start_time)
 
 
 if __name__ == '__main__':
     args = parse_args()
 
+    config['db_name'] = threading.current_thread().dbname = args.database
     # handle paths option
     if args.addons_path:
         odoo.tools.config['addons_path'] = ','.join([args.addons_path, odoo.tools.config['addons_path']])
@@ -224,5 +231,5 @@ if __name__ == '__main__':
     try:
         args.func(args)
     except Exception:
-        _logger.error("%s tests failed", args.func.__name__[5:])
-        raise
+        _logger.exception("%s tests failed", args.func.__name__[5:])
+        exit(1)

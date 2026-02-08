@@ -3,13 +3,12 @@
 
 import logging
 import math
-import re
-import time
 
 from lxml import etree
 
 from odoo import api, fields, models, tools, _
 from odoo.exceptions import UserError
+from odoo.tools import parse_date
 
 _logger = logging.getLogger(__name__)
 
@@ -19,12 +18,11 @@ except ImportError:
     _logger.warning("The num2words python library is not installed, amount-to-text features won't be fully available.")
     num2words = None
 
-CURRENCY_DISPLAY_PATTERN = re.compile(r'(\w+)\s*(?:\((.*)\))?')
-
 
 class Currency(models.Model):
     _name = "res.currency"
     _description = "Currency"
+    _rec_names_search = ['name', 'full_name']
     _order = 'active desc, name'
 
     # Note: 'code' column was removed as of v6.0, the 'name' should now hold the ISO code.
@@ -45,8 +43,8 @@ class Currency(models.Model):
     position = fields.Selection([('after', 'After Amount'), ('before', 'Before Amount')], default='after',
         string='Symbol Position', help="Determines where the currency symbol should be placed after or before the amount.")
     date = fields.Date(compute='_compute_date')
-    currency_unit_label = fields.Char(string="Currency Unit", help="Currency Unit Name")
-    currency_subunit_label = fields.Char(string="Currency Subunit", help="Currency Subunit Name")
+    currency_unit_label = fields.Char(string="Currency Unit")
+    currency_subunit_label = fields.Char(string="Currency Subunit")
     is_current_company_currency = fields.Boolean(compute='_compute_is_current_company_currency')
 
     _sql_constraints = [
@@ -112,16 +110,37 @@ class Currency(models.Model):
     def _get_rates(self, company, date):
         if not self.ids:
             return {}
-        self.env['res.currency.rate'].flush(['rate', 'currency_id', 'company_id', 'name'])
-        query = """SELECT c.id,
-                          COALESCE((SELECT r.rate FROM res_currency_rate r
-                                  WHERE r.currency_id = c.id AND r.name <= %s
-                                    AND (r.company_id IS NULL OR r.company_id = %s)
-                               ORDER BY r.company_id, r.name DESC
-                                  LIMIT 1), 1.0) AS rate
-                   FROM res_currency c
-                   WHERE c.id IN %s"""
-        self._cr.execute(query, (date, company.id, tuple(self.ids)))
+        self.env['res.currency.rate'].flush_model(['rate', 'currency_id', 'company_id', 'name'])
+        query = """
+            SELECT c.id,
+                   COALESCE(
+                       (             -- take the first rate before the given date
+                           SELECT r.rate
+                             FROM res_currency_rate r
+                            WHERE r.currency_id = c.id
+                              AND r.name <= %(date)s
+                              AND (r.company_id IS NULL OR r.company_id = %(company_id)s)
+                         ORDER BY r.company_id, r.name DESC
+                            LIMIT 1
+                       ),
+                       (             -- if no rate is found, take the rate for the very first date
+                           SELECT r.rate
+                             FROM res_currency_rate r
+                            WHERE r.currency_id = c.id
+                              AND (r.company_id IS NULL OR r.company_id = %(company_id)s)
+                         ORDER BY r.company_id, r.name ASC
+                            LIMIT 1
+                       ),
+                       1.0           -- fallback to 1
+                   ) AS rate
+              FROM res_currency c
+             WHERE c.id IN %(currency_ids)s
+        """
+        self._cr.execute(query, {
+            'date': date,
+            'company_id': company.id,
+            'currency_ids': tuple(self.ids),
+        })
         currency_rates = dict(self._cr.fetchall())
         return currency_rates
 
@@ -158,15 +177,6 @@ class Currency(models.Model):
         for currency in self:
             currency.date = currency.rate_ids[:1].name
 
-    @api.model
-    def _name_search(self, name, args=None, operator='ilike', limit=100, name_get_uid=None):
-        results = super(Currency, self)._name_search(name, args, operator=operator, limit=limit, name_get_uid=name_get_uid)
-        if not results:
-            name_match = CURRENCY_DISPLAY_PATTERN.match(name)
-            if name_match:
-                results = super(Currency, self)._name_search(name_match.group(1), args, operator=operator, limit=limit, name_get_uid=name_get_uid)
-        return results
-
     def name_get(self):
         return [(currency.id, tools.ustr(currency.name)) for currency in self]
 
@@ -198,6 +208,17 @@ class Currency(models.Model):
                         amt_word=self.currency_subunit_label,
                         )
         return amount_words
+
+    def format(self, amount):
+        """Return ``amount`` formatted according to ``self``'s rounding rules, symbols and positions.
+
+           Also take care of removing the minus sign when 0.0 is negative
+
+           :param float amount: the amount to round
+           :return: formatted str
+        """
+        self.ensure_one()
+        return tools.format_amount(self.env, amount + 0.0, self)
 
     def round(self, amount):
         """Return ``amount`` rounded  according to ``self``'s rounding rules.
@@ -269,8 +290,11 @@ class Currency(models.Model):
         # apply conversion rate
         if self == to_currency:
             to_amount = from_amount
-        else:
+        elif from_amount:
             to_amount = from_amount * self._get_conversion_rate(self, to_currency, company, date)
+        else:
+            return 0.0
+
         # apply rounding
         return to_currency.round(to_amount) if round else to_amount
 
@@ -302,27 +326,32 @@ class Currency(models.Model):
                  LIMIT 1) AS date_end
             FROM res_currency_rate r
             JOIN res_company c ON (r.company_id is null or r.company_id = c.id)
-            ORDER BY date_end
         """
 
     @api.model
-    def _fields_view_get(self, view_id=None, view_type='form', toolbar=False, submenu=False):
-        result = super(Currency, self)._fields_view_get(view_id=view_id, view_type=view_type, toolbar=toolbar, submenu=submenu)
+    def _get_view_cache_key(self, view_id=None, view_type='form', **options):
+        """The override of _get_view changing the rate field labels according to the company currency
+        makes the view cache dependent on the company currency"""
+        key = super()._get_view_cache_key(view_id, view_type, **options)
+        return key + ((self.env['res.company'].browse(self._context.get('company_id')) or self.env.company).currency_id.name,)
+
+    @api.model
+    def _get_view(self, view_id=None, view_type='form', **options):
+        arch, view = super()._get_view(view_id, view_type, **options)
         if view_type in ('tree', 'form'):
             currency_name = (self.env['res.company'].browse(self._context.get('company_id')) or self.env.company).currency_id.name
-            doc = etree.XML(result['arch'])
             for field in [['company_rate', _('Unit per %s', currency_name)],
                           ['inverse_company_rate', _('%s per Unit', currency_name)]]:
-                node = doc.xpath("//tree//field[@name='%s']" % field[0])
+                node = arch.xpath("//tree//field[@name='%s']" % field[0])
                 if node:
                     node[0].set('string', field[1])
-            result['arch'] = etree.tostring(doc, encoding='unicode')
-        return result
+        return arch, view
 
 
 class CurrencyRate(models.Model):
     _name = "res.currency.rate"
     _description = "Currency Rate"
+    _rec_names_search = ['name', 'rate']
     _order = "name desc"
 
     name = fields.Date(string='Date', required=True, index=True,
@@ -441,36 +470,26 @@ class CurrencyRate(models.Model):
 
     @api.model
     def _name_search(self, name, args=None, operator='ilike', limit=100, name_get_uid=None):
-        if operator in ['=', '!=']:
-            try:
-                date_format = '%Y-%m-%d'
-                if self._context.get('lang'):
-                    lang_id = self.env['res.lang']._search([('code', '=', self._context['lang'])], access_rights_uid=name_get_uid)
-                    if lang_id:
-                        date_format = self.browse(lang_id).date_format
-                name = time.strftime('%Y-%m-%d', time.strptime(name, date_format))
-            except ValueError:
-                try:
-                    args.append(('rate', operator, float(name)))
-                except ValueError:
-                    return []
-                name = ''
-                operator = 'ilike'
-        return super(CurrencyRate, self)._name_search(name, args=args, operator=operator, limit=limit, name_get_uid=name_get_uid)
+        return super()._name_search(parse_date(self.env, name), args, operator, limit, name_get_uid)
 
     @api.model
-    def _fields_view_get(self, view_id=None, view_type='form', toolbar=False, submenu=False):
-        result = super(CurrencyRate, self)._fields_view_get(view_id=view_id, view_type=view_type, toolbar=toolbar, submenu=submenu)
+    def _get_view_cache_key(self, view_id=None, view_type='form', **options):
+        """The override of _get_view changing the rate field labels according to the company currency
+        makes the view cache dependent on the company currency"""
+        key = super()._get_view_cache_key(view_id, view_type, **options)
+        return key + ((self.env['res.company'].browse(self._context.get('company_id')) or self.env.company).currency_id.name,)
+
+    @api.model
+    def _get_view(self, view_id=None, view_type='form', **options):
+        arch, view = super()._get_view(view_id, view_type, **options)
         if view_type in ('tree'):
             names = {
                 'company_currency_name': (self.env['res.company'].browse(self._context.get('company_id')) or self.env.company).currency_id.name,
                 'rate_currency_name': self.env['res.currency'].browse(self._context.get('active_id')).name or 'Unit',
             }
-            doc = etree.XML(result['arch'])
             for field in [['company_rate', _('%(rate_currency_name)s per %(company_currency_name)s', **names)],
                           ['inverse_company_rate', _('%(company_currency_name)s per %(rate_currency_name)s', **names)]]:
-                node = doc.xpath("//tree//field[@name='%s']" % field[0])
+                node = arch.xpath("//tree//field[@name='%s']" % field[0])
                 if node:
                     node[0].set('string', field[1])
-            result['arch'] = etree.tostring(doc, encoding='unicode')
-        return result
+        return arch, view

@@ -49,7 +49,7 @@ class TestOnChange(SavepointCaseWithUserDemo):
             'author': USER.id,
             'size': 0,
         }
-        self.env.cache.invalidate()
+        self.env.invalidate_all()
         result = self.Message.onchange(values, 'discussion', field_onchange)
         self.assertIn('name', result['value'])
         self.assertEqual(result['value']['name'], "[%s] %s" % (discussion.name, USER.name))
@@ -62,7 +62,7 @@ class TestOnChange(SavepointCaseWithUserDemo):
             'author': USER.id,
             'size': 0,
         }
-        self.env.cache.invalidate()
+        self.env.invalidate_all()
         result = self.Message.onchange(values, 'body', field_onchange)
         self.assertIn('size', result['value'])
         self.assertEqual(result['value']['size'], len(BODY))
@@ -76,7 +76,7 @@ class TestOnChange(SavepointCaseWithUserDemo):
             'author': USER.id,
             'size': 0,
         }
-        self.env.cache.invalidate()
+        self.env.invalidate_all()
         result = self.Message.onchange(values, 'body', field_onchange)
         self.assertNotIn('name', result['value'])
 
@@ -94,7 +94,7 @@ class TestOnChange(SavepointCaseWithUserDemo):
             'root_categ': False,
         }
 
-        self.env.cache.invalidate()
+        self.env.invalidate_all()
         result = Category.onchange(values, 'parent', field_onchange).get('value', {})
         self.assertIn('root_categ', result)
         self.assertEqual(result['root_categ'], root.name_get()[0])
@@ -102,7 +102,7 @@ class TestOnChange(SavepointCaseWithUserDemo):
         values.update(result)
         values['parent'] = False
 
-        self.env.cache.invalidate()
+        self.env.invalidate_all()
         result = Category.onchange(values, 'parent', field_onchange).get('value', {})
         self.assertIn('root_categ', result)
         self.assertIs(result['root_categ'], False)
@@ -143,7 +143,7 @@ class TestOnChange(SavepointCaseWithUserDemo):
                 }),
             ],
         }
-        self.env.cache.invalidate()
+        self.env.invalidate_all()
         result = self.Discussion.onchange(values, 'name', field_onchange)
         self.assertIn('messages', result['value'])
         self.assertEqual(result['value']['messages'], [
@@ -214,7 +214,7 @@ class TestOnChange(SavepointCaseWithUserDemo):
                 }),
             ],
         }
-        self.env.cache.invalidate()
+        self.env.invalidate_all()
         result = self.Discussion.onchange(values, 'name', field_onchange)
         self.assertIn('messages', result['value'])
         self.assertItemsEqual(result['value']['messages'], [
@@ -263,7 +263,7 @@ class TestOnChange(SavepointCaseWithUserDemo):
             'lines': [Command.set([line1.id]),
                       Command.create({'name': False, 'partner': False, 'tags': [Command.clear()]})],
         }
-        self.env.cache.invalidate()
+        self.env.invalidate_all()
 
         result = multi.onchange(values, 'partner', field_onchange)
         self.assertEqual(result['value'], {
@@ -292,7 +292,7 @@ class TestOnChange(SavepointCaseWithUserDemo):
                               'partner': False,
                               'tags': [Command.clear(), Command.create({'name': 'Tag'})]})],
         }
-        self.env.cache.invalidate()
+        self.env.invalidate_all()
         result = multi.onchange(values, 'partner', field_onchange)
         expected_value = {
             'name': partner2.name,
@@ -313,13 +313,13 @@ class TestOnChange(SavepointCaseWithUserDemo):
         self.assertEqual(result['value'], expected_value)
 
         # ensure ID is not returned when asked and a many2many record is set to be created
-        self.env.cache.invalidate()
+        self.env.invalidate_all()
 
         result = multi.onchange(values, 'partner', dict(field_onchange, **{'lines.tags.id': None}))
         self.assertEqual(result['value'], expected_value)
 
         # ensure inverse of one2many field is not returned
-        self.env.cache.invalidate()
+        self.env.invalidate_all()
 
         result = multi.onchange(values, 'partner', dict(field_onchange, **{'lines.multi': None}))
         self.assertEqual(result['value'], expected_value)
@@ -348,7 +348,7 @@ class TestOnChange(SavepointCaseWithUserDemo):
             'messages': [Command.link(msg.id) for msg in discussion.messages],
             'participants': [Command.link(usr.id) for usr in discussion.participants],
         }
-        self.env.cache.invalidate()
+        self.env.invalidate_all()
         result = discussion.onchange(values, 'moderator', field_onchange)
 
         self.assertIn('participants', result['value'])
@@ -368,13 +368,13 @@ class TestOnChange(SavepointCaseWithUserDemo):
         self.env['ir.default'].set('test_new_api.foo', 'value2', 666, condition='value1=42')
 
         # setting 'value1' to 42 should trigger the change of 'value2'
-        self.env.cache.invalidate()
+        self.env.invalidate_all()
         values = {'name': 'X', 'value1': 42, 'value2': False}
         result = Foo.onchange(values, 'value1', field_onchange)
         self.assertEqual(result['value'], {'value2': 666})
 
         # setting 'value1' to 24 should not trigger the change of 'value2'
-        self.env.cache.invalidate()
+        self.env.invalidate_all()
         values = {'name': 'X', 'value1': 24, 'value2': False}
         result = Foo.onchange(values, 'value1', field_onchange)
         self.assertEqual(result['value'], {})
@@ -424,9 +424,7 @@ class TestOnChange(SavepointCaseWithUserDemo):
 
         # mimic UI behaviour, so we get subfields
         # (we need at least subfield: 'important_emails.important')
-        view_info = self.Discussion.fields_view_get(
-            view_id=self.env.ref('test_new_api.discussion_form').id,
-            view_type='form')
+        view_info = self.Discussion.get_view(self.env.ref('test_new_api.discussion_form').id, 'form')
         field_onchange = self.Discussion._onchange_spec(view_info=view_info)
         self.assertEqual(field_onchange.get('messages'), '1')
 
@@ -444,7 +442,7 @@ class TestOnChange(SavepointCaseWithUserDemo):
         })
 
         # check if server-side cache is working correctly
-        self.env.cache.invalidate()
+        self.env.invalidate_all()
         self.assertIn(email, discussion.emails)
         self.assertNotIn(email, discussion.important_emails)
         email.important = True
@@ -453,7 +451,7 @@ class TestOnChange(SavepointCaseWithUserDemo):
         # check that when trigger an onchange, we don't reset important emails
         # (force `invalidate` as but appear in onchange only when we get a cache
         # miss)
-        self.env.cache.invalidate()
+        self.env.invalidate_all()
         self.assertEqual(len(discussion.messages), 4)
         values = {
             'name': "Foo Bar",
@@ -464,7 +462,7 @@ class TestOnChange(SavepointCaseWithUserDemo):
             'important_messages': [Command.link(msg.id) for msg in discussion.important_messages],
             'important_emails': [Command.link(eml.id) for eml in discussion.important_emails],
         }
-        self.env.cache.invalidate()
+        self.env.invalidate_all()
         result = discussion.onchange(values, 'name', field_onchange)
 
         self.assertEqual(
@@ -496,13 +494,13 @@ class TestOnChange(SavepointCaseWithUserDemo):
             'message_currency': self.env.user.name_get()[0],
         }
 
-        self.env.cache.invalidate()
+        self.env.invalidate_all()
         Message = self.env['test_new_api.related']
         result = Message.onchange(value, 'message', field_onchange)
 
         self.assertEqual(result['value'], onchange_result)
 
-        self.env.cache.invalidate()
+        self.env.invalidate_all()
         Message = self.env(user=self.user_demo.id)['test_new_api.related']
         result = Message.onchange(value, 'message', field_onchange)
 
@@ -532,7 +530,7 @@ class TestOnChange(SavepointCaseWithUserDemo):
 
         # changing 'discussion' on message should not read 'messages' on discussion
         with patch.object(type(discussion), 'read', mock_read, create=True):
-            self.env.cache.invalidate()
+            self.env.invalidate_all()
             self.Message.onchange(values, 'discussion', field_onchange)
 
         self.assertFalse(called[0], "discussion.messages has been read")
@@ -599,35 +597,26 @@ class TestOnChange(SavepointCaseWithUserDemo):
         self.assertEqual(payment.tag_repeat, 3)
         self.assertEqual(payment.tag_string, 'BarBarBar')
 
-    @patch('odoo.fields.html_sanitize', return_value='<p>comment</p>')
-    def test_onchange_sanitize(self, patch):
-        self.assertTrue(self.registry['test_new_api.mixed'].comment2.sanitize)
-
-        record = self.env['test_new_api.mixed'].create({
-            'comment2': '<p>comment</p>',
+    def test_display_name(self):
+        self.env['ir.ui.view'].create({
+            'name': 'test_new_api.multi.tag form view',
+            'model': 'test_new_api.multi.tag',
+            'arch': """
+                <form>
+                    <field name="name"/>
+                    <field name="display_name"/>
+                </form>
+            """,
         })
 
-        # in a perfect world this should be 1, but at the moment the value is
-        # sanitized twice during creation of the record
-        self.assertEqual(patch.call_count, 2)
+        form = common.Form(self.env['test_new_api.multi.tag'])
+        self.assertEqual(form.name, False)
+        self.assertEqual(form.display_name, "")
 
-        # new value needs to be validated, so it is sanitized once more
-        record.comment2 = '<p>comment</p>'
-        self.assertEqual(patch.call_count, 3)
-
-        # the value is already sanitized for flushing
-        record.flush()
-        self.assertEqual(patch.call_count, 3)
-
-        # value coming from db does not need to be sanitized
-        record.invalidate_cache()
-        record.comment2
-        self.assertEqual(patch.call_count, 3)
-
-        # value coming from db during an onchange does not need to be sanitized
-        new_record = record.new(origin=record)
-        new_record.comment2
-        self.assertEqual(patch.call_count, 3)
+        record = form.save()
+        self.assertEqual(record.name, False)
+        self.assertEqual(record.display_name, "")
+        self.assertEqual(record.name_get(), [(record.id, "")])
 
 
 class TestComputeOnchange(common.TransactionCase):
@@ -863,7 +852,7 @@ class TestComputeOnchange(common.TransactionCase):
                 Command.create({'name': 'Z'}),
             ],
         })
-        record.flush()
+        self.env.flush_all()
         self.assertEqual(record.child_ids.mapped('name'), list('WXYZ'))
         self.assertEqual(record.cost, 22)
 
@@ -884,7 +873,7 @@ class TestComputeOnchange(common.TransactionCase):
     def test_onchange_editable_compute_one2many(self):
         # create a record with a computed editable field ('edit') on lines
         record = self.env['test_new_api.compute_editable'].create({'line_ids': [(0, 0, {'value': 7})]})
-        record.flush()
+        self.env.flush_all()
         line = record.line_ids
         self.assertRecordValues(line, [{'value': 7, 'edit': 7, 'count': 0}])
 
@@ -954,8 +943,8 @@ class TestComputeOnchange(common.TransactionCase):
             {'name': 'bar', 'count': 1},
             {'name': 'baz', 'count': 0},
         ])
-        record.flush()
-        record.invalidate_cache()
+        self.env.flush_all()
+        self.env.invalidate_all()
         self.assertRecordValues(record.line_ids, [
             {'name': 'foo', 'count': 1},
             {'name': 'bar', 'count': 1},

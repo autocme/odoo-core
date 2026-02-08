@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
-
+SUPPORTED_DEBUGGER = {'pdb', 'ipdb', 'wdb', 'pudb'}
 from . import _monkeypatches
 from . import _monkeypatches_pytz
 
@@ -10,24 +10,25 @@ if not hasattr(urls, 'url_join'):
     # see https://github.com/pallets/werkzeug/blob/2.3.0/src/werkzeug/urls.py for replacement
     from . import _monkeypatches_urls
 
+from . import appdirs
+from . import cloc
+from . import pdf
 from . import pycompat
 from . import win32
-from . import appdirs
-from . import pdf
-from . import cloc
+from .barcode import *
 from .config import config
-from .misc import *
-from .translate import *
-from .image import *
-from .sql import *
-from .float_utils import *
-from .mail import *
-from .func import *
-from .debugger import *
-from .xml_utils import *
 from .date_utils import *
-from .convert import *
+from .float_utils import *
+from .func import *
+from .image import *
+from .mail import *
+from .misc import *
+from .query import Query, _generate_table_alias
+from .sql import *
 from .template_inheritance import *
+from .translate import *
+from .xml_utils import *
+from .convert import *
 from . import osutil
 from .js_transpiler import transpile_javascript, is_odoo_module, URL_RE, ODOO_MODULE_RE
 from .sourcemap_generator import SourceMapGenerator
