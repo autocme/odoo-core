@@ -1,7 +1,6 @@
-# -*- coding: utf-8 -*-
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 
-from odoo import api, fields, models, _
+from odoo import api, fields, models
 from odoo.exceptions import ValidationError
 
 # see http://doc.qt.io/archives/qt-4.8/qprinter.html#PaperSize-enum
@@ -163,12 +162,12 @@ PAPER_SIZES = [
 ]
 
 
-class report_paperformat(models.Model):
-    _name = "report.paperformat"
+class ReportPaperformat(models.Model):
+    _name = 'report.paperformat'
     _description = "Paper Format Config"
 
     name = fields.Char('Name', required=True)
-    default = fields.Boolean('Default paper format ?')
+    default = fields.Boolean('Default paper format?')
     format = fields.Selection([(ps['key'], ps['description']) for ps in PAPER_SIZES], 'Paper size', default='A4', help="Select Proper Paper size")
     margin_top = fields.Float('Top Margin (mm)', default=40)
     margin_bottom = fields.Float('Bottom Margin (mm)', default=20)
@@ -187,11 +186,12 @@ class report_paperformat(models.Model):
     report_ids = fields.One2many('ir.actions.report', 'paperformat_id', 'Associated reports', help="Explicitly associated reports")
     print_page_width = fields.Float('Print page width (mm)', compute='_compute_print_page_size')
     print_page_height = fields.Float('Print page height (mm)', compute='_compute_print_page_size')
+    css_margins = fields.Boolean('Use css margins', default=False)
 
     @api.constrains('format')
     def _check_format_or_page(self):
         if self.filtered(lambda x: x.format != 'custom' and (x.page_width or x.page_height)):
-            raise ValidationError(_('You can select either a format or a specific page width/height, but not both.'))
+            raise ValidationError(self.env._('You can select either a format or a specific page width/height, but not both.'))
 
     def _compute_print_page_size(self):
         for record in self:

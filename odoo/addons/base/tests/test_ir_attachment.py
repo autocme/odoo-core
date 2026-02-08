@@ -1,16 +1,20 @@
 # -*- coding: utf-8 -*-
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 import base64
-import binascii
 import hashlib
 import io
 import os
+import contextlib
+from unittest.mock import patch
 
 from PIL import Image
 
-from odoo.exceptions import AccessError
+from odoo.api import SUPERUSER_ID
+from odoo.exceptions import AccessError, ValidationError
+from odoo.addons.base.models.ir_attachment import IrAttachment
 from odoo.addons.base.tests.common import TransactionCaseWithUserDemo
-from odoo.tools import image_to_base64
+from odoo.tools import mute_logger
+from odoo.tools.image import image_to_base64
 
 HASH_SPLIT = 2      # FIXME: testing implementations detail is not a good idea
 
@@ -234,6 +238,50 @@ class TestIrAttachment(TransactionCaseWithUserDemo):
         self.assertEqual(document3.store_fname, self.blob1_fname)
         self.assertEqual(document3.checksum, self.blob1_hash)
 
+    def test_12_gc(self):
+        # the data needs to be unique so that no other attachment link
+        # the file so that the gc removes it
+        unique_blob = os.urandom(16)
+        a1 = self.Attachment.create({'name': 'a1', 'raw': unique_blob})
+        store_path = os.path.join(self.filestore, a1.store_fname)
+        self.assertTrue(os.path.isfile(store_path), 'file exists')
+        a1.unlink()
+        self.Attachment._gc_file_store_unsafe()
+        self.assertFalse(os.path.isfile(store_path), 'file removed')
+
+    def test_13_rollback(self):
+        # the data needs to be unique so that no other attachment link
+        # the file so that the gc removes it
+        unique_blob = os.urandom(16)
+        with contextlib.closing(self.cr.savepoint()):
+            a1 = self.env['ir.attachment'].create({'name': 'a1', 'raw': unique_blob})
+            store_path = os.path.join(self.filestore, a1.store_fname)
+            self.assertTrue(os.path.isfile(store_path), 'file exists')
+        self.env['ir.attachment']._gc_file_store_unsafe()
+        self.assertFalse(os.path.isfile(store_path), 'file removed')
+
+    def test_14_invalid_mimetype_with_correct_file_extension_no_post_processing(self):
+        # test with fake svg with png mimetype
+        unique_blob = b'<svg xmlns="http://www.w3.org/2000/svg"></svg>'
+        a1 = self.Attachment.create({'name': 'a1', 'raw': unique_blob, 'mimetype': 'image/png'})
+        self.assertEqual(a1.raw, unique_blob)
+        self.assertEqual(a1.mimetype, 'image/png')
+
+    def test_15_read_bin_size_doesnt_read_datas(self):
+        self.env.invalidate_all()
+        IrAttachment = self.registry['ir.attachment']
+        main_partner = self.env.ref('base.main_partner')
+        with patch.object(
+            IrAttachment,
+            '_file_read',
+            side_effect=IrAttachment._file_read,
+            autospec=True,
+        ) as patch_file_read:
+            self.env['res.partner'].with_context(bin_size=True).search_read(
+                [('id', 'in', main_partner.ids)], ['image_128']
+            )
+            self.assertEqual(patch_file_read.call_count, 0)
+
 
 class TestPermissions(TransactionCaseWithUserDemo):
     def setUp(self):
@@ -255,19 +303,101 @@ class TestPermissions(TransactionCaseWithUserDemo):
             'domain_force': "[('id', '!=', %s)]" % record.id,
             'perm_read': False
         })
-        a.flush()
-        a.invalidate_cache(ids=a.ids)
+        self.env.flush_all()
+        a.invalidate_recordset()
 
-    def test_no_read_permission(self):
+    def test_read_permission(self):
         """If the record can't be read, the attachment can't be read either
+        If the attachment is public, the attachment can be read even if the record can't be read
+        If the attachment has no res_model/res_id, it can be read by its author and admins only
         """
         # check that the information can be read out of the box
         self.attachment.datas
         # prevent read access on record
         self.rule.perm_read = True
-        self.attachment.invalidate_cache(ids=self.attachment.ids)
+        self.attachment.invalidate_recordset()
         with self.assertRaises(AccessError):
             self.attachment.datas
+
+        # Make the attachment public
+        self.attachment.sudo().public = True
+        # Check the information can be read again
+        self.attachment.datas
+        # Remove the public access
+        self.attachment.sudo().public = False
+        # Check the record can no longer be accessed
+        with self.assertRaises(AccessError):
+            self.attachment.datas
+
+        # Create an attachment as user without res_model/res_id
+        attachment_user = self.Attachments.create({'name': 'foo'})
+        # Check the user can access his own attachment
+        attachment_user.datas
+        # Create an attachment as superuser without res_model/res_id
+        attachment_admin = self.Attachments.with_user(SUPERUSER_ID).create({'name': 'foo'})
+        # Check the record cannot be accessed by a regular user
+        with self.assertRaises(AccessError):
+            attachment_admin.with_user(self.env.user).datas
+        # Check the record can be accessed by an admin (other than superuser)
+        admin_user = self.env.ref('base.user_admin')
+        # Safety assert that base.user_admin is not the superuser, otherwise the test is useless
+        self.assertNotEqual(SUPERUSER_ID, admin_user.id)
+        attachment_admin.with_user(admin_user).datas
+
+    @mute_logger("odoo.addons.base.models.ir_rule", "odoo.models")
+    def test_field_read_permission(self):
+        """If the record field can't be read,
+        e.g. `groups="base.group_system"` on the field,
+        the attachment can't be read either.
+        """
+        # check that the information can be read out of the box
+        main_partner = self.env.ref('base.main_partner')
+        self.assertTrue(main_partner.image_128)
+        attachment = self.env['ir.attachment'].search([
+            ('res_model', '=', 'res.partner'),
+            ('res_id', '=', main_partner.id),
+            ('res_field', '=', 'image_128')
+        ])
+        self.assertTrue(attachment.datas)
+        with self.assertQueries([
+            # security SQL contains public check or accessible field with
+            # res_id IN accessible corecords for a given res_model
+            """
+            SELECT "ir_attachment"."id"
+            FROM "ir_attachment"
+            WHERE ("ir_attachment"."res_field" IN %s AND "ir_attachment"."res_id" IN %s AND "ir_attachment"."res_model" IN %s AND (
+                "ir_attachment"."public" IS TRUE
+                OR (
+                    ("ir_attachment"."res_field" IN %s OR "ir_attachment"."res_field" IS NULL)
+                    AND "ir_attachment"."res_id" IN (
+                        SELECT "res_partner"."id"
+                        FROM "res_partner"
+                        WHERE "res_partner"."id" IN %s AND (
+                            ("res_partner"."company_id" IN %s OR "res_partner"."company_id" IS NULL)
+                            OR "res_partner"."partner_share" IS NOT TRUE
+                        )
+                    )
+                    AND "ir_attachment"."res_model" IN %s
+                )
+            ))
+            ORDER BY "ir_attachment"."id" DESC
+            """
+        ]):
+            self.env['ir.attachment'].search([
+                ('res_model', '=', 'res.partner'),
+                ('res_id', '=', main_partner.id),
+                ('res_field', '=', 'image_128')
+            ])
+
+        # Patch the field `res.partner.image_128` to make it unreadable by the demo user
+        self.patch(self.env.registry['res.partner']._fields['image_128'], 'groups', 'base.group_system')
+
+        # Assert the field can't be read
+        with self.assertRaises(AccessError):
+            main_partner.image_128
+        # Assert the attachment related to the field can't be read
+        with self.assertRaises(AccessError):
+            attachment.datas
 
     def test_with_write_permissions(self):
         """With write permissions to the linked record, attachment can be
@@ -298,7 +428,7 @@ class TestPermissions(TransactionCaseWithUserDemo):
         wrinkles as the ACLs may diverge a lot more
         """
         # create an other unwritable record in a different model
-        unwritable = self.env['res.users.log'].create({})
+        unwritable = self.env['res.users.apikeys.description'].create({'name': 'Unwritable'})
         with self.assertRaises(AccessError):
             unwritable.write({})  # checks unwritability
         # create a writable record in the same model
@@ -319,3 +449,27 @@ class TestPermissions(TransactionCaseWithUserDemo):
         # even from a record with write permissions
         with self.assertRaises(AccessError):
             copied.copy({'res_model': unwritable._name, 'res_id': unwritable.id})
+
+    def test_write_error(self):
+        # try to write a file in a place where we have no access
+        # /proc is not writeable, check if we have an error raised
+        self.patch(IrAttachment, '_get_path', lambda self, binary, _checksum: (binary, '/proc/dummy_test'))
+        with self.assertRaises(OSError):
+            self.env['ir.attachment']._file_write(b'test', 'test')
+
+    def test_write_create_url_binary_attachment(self):
+        with self.assertRaisesRegex(ValidationError, r"Sorry, you are not allowed to write on this document"):
+            self.Attachments.create({'name': 'Py', 'url': '/blabla.js', 'raw': b'Something'})
+        with self.assertRaisesRegex(ValidationError, r"Sorry, you are not allowed to write on this document"):
+            self.Attachments.create({'name': 'Py', 'url': '/blabla.js', 'raw': b'Something'})
+        with self.assertRaisesRegex(ValidationError, r"Sorry, you are not allowed to write on this document"):
+            self.Attachments.with_context(default_url='/blabla.js').create({'name': 'Py', 'raw': b'Something'})
+
+        existing_attachment = self.Attachments.create({'name': 'aaa'})
+        with self.assertRaisesRegex(ValidationError, r"Sorry, you are not allowed to write on this document"):
+            existing_attachment.url = '/blabla.js'
+        existing_attachment.type = 'url'
+        existing_attachment.url = '/blabla.js'
+
+        with self.assertRaisesRegex(ValidationError, r"Sorry, you are not allowed to write on this document"):
+            existing_attachment.type = 'binary'

@@ -6,36 +6,11 @@ import re
 import subprocess
 from unittest import skipIf
 from odoo import tools
+from odoo.tests import tagged
+from odoo.tools.misc import file_path
+from odoo.modules import get_modules
 
 from . import lint_case
-
-RULES = ('{'
-        '"no-undef": "error",'
-        '"no-restricted-globals": ["error", "event", "self"],'
-        '"no-const-assign": ["error"],'
-        '"no-debugger": ["error"],'
-        '"no-dupe-class-members": ["error"]'
-        '}'
-)
-PARSER_OPTIONS = '{ecmaVersion: 2019, sourceType: module}'
-GLOBAL = ','.join([
-        'owl',
-        'odoo',
-        '$',
-        'jQuery',
-        '_',
-        'Chart',
-        'fuzzy',
-        'QWeb2',
-        'Popover',
-        'StackTrace',
-        'QUnit',
-        'luxon',
-        'moment',
-        'py',
-        'ClipboardJS',
-        'globalThis',
-])
 
 _logger = logging.getLogger(__name__)
 
@@ -44,21 +19,34 @@ try:
 except IOError:
     eslint = None
 
+
 @skipIf(eslint is None, "eslint tool not found on this system")
+@tagged("test_themes")
 class TestESLint(lint_case.LintCase):
 
     longMessage = True
 
-    def test_eslint_version(self):
+    def _test_eslint(self, modules, eslintrc_path):
         """ Test that there are no eslint errors in javascript files """
 
         files_to_check = [
-            p for p in self.iter_module_files('**/static/**/*.js')
+            p for p in self.iter_module_files('**/static/**/*.js', modules=modules)
             if not re.match('.*/libs?/.*', p)  # don't check libraries
+            if not re.match('.*/o_spreadsheet/o_spreadsheet.js', p) # don't check generated code
         ]
-
         _logger.info('Testing %s js files', len(files_to_check))
-        # https://eslint.org/docs/user-guide/command-line-interface
-        cmd = [eslint, '--no-eslintrc', '--env', 'browser', '--env', 'es2017', '--parser-options', PARSER_OPTIONS, '--rule', RULES, '--global', GLOBAL] + files_to_check
-        process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
-        self.assertEqual(process.returncode, 0, msg=process.stdout.decode())
+        cmd = [eslint, '--no-ignore', '--no-eslintrc', '-c', eslintrc_path] + files_to_check
+        process = subprocess.run(cmd, capture_output=True, encoding="utf-8", check=False)
+        self.assertEqual(process.returncode, 0, msg=f"""
+stdout: {process.stdout}
+Perhaps you might benefit from installing the tooling found at:
+https://github.com/odoo/odoo/wiki/Javascript-coding-guidelines#use-a-linter \n
+stderr: {process.stderr}
+""")
+
+    def test_eslint(self):
+        basic_test, strict_test = [], []
+        for module in get_modules():
+            strict_test.append(module) if re.search('^point_of_sale$|^pos_.*$|^.*_pos$|^.*_pos_.*$', module) else basic_test.append(module)
+        self._test_eslint(basic_test, file_path('test_lint/tests/eslintrc'))
+        self._test_eslint(strict_test, file_path('web/tooling/_eslintrc.json'))

@@ -1,8 +1,6 @@
-# -*- coding: utf-8 -*-
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 
 from . import assetsbundle
-from . import qweb
 
 from . import ir_model
 from . import ir_sequence
@@ -10,12 +8,13 @@ from . import ir_ui_menu
 from . import ir_ui_view
 from . import ir_asset
 from . import ir_actions
+from . import ir_embedded_actions
 from . import ir_actions_report
 from . import ir_attachment
+from . import ir_binary
 from . import ir_cron
 from . import ir_filters
 from . import ir_default
-from . import ir_translation
 from . import ir_exports
 from . import ir_rule
 from . import ir_config_parameter
@@ -26,10 +25,11 @@ from . import ir_qweb
 from . import ir_qweb_fields
 from . import ir_http
 from . import ir_logging
-from . import ir_property
 from . import ir_module
 from . import ir_demo
 from . import ir_demo_failure
+from . import properties_base_definition
+from . import properties_base_definition_mixin
 from . import report_layout
 from . import report_paperformat
 
@@ -44,6 +44,11 @@ from . import res_bank
 from . import res_config
 from . import res_currency
 from . import res_company
+from . import res_groups_privilege
+from . import res_groups
 from . import res_users
+from . import res_users_settings
+from . import res_users_deletion
+from . import res_device
 
 from . import decimal_precision

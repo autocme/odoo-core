@@ -7,10 +7,11 @@
 This here module is useful to validate that they're doing what they're 
 supposed to do
     """,
-    'depends': ['base'],
+    'depends': ['base', 'web'],
     'data': [
-        'ir.model.access.csv',
-        'menu.xml',
+        'security/ir.model.access.csv',
+        'views/menu.xml',
     ],
+    'author': 'Odoo S.A.',
     'license': 'LGPL-3',
 }

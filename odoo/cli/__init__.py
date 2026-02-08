@@ -1,17 +1,4 @@
-import logging
-import sys
-import os
+# Import just the command, the rest will get imported as needed
+from .command import Command, main  # noqa: F401
 
-import odoo
-
-from .command import Command, main
-
-from . import cloc
-from . import deploy
-from . import scaffold
-from . import server
-from . import shell
-from . import start
-from . import populate
-from . import tsconfig
-from . import genproxytoken
+COMMAND = None

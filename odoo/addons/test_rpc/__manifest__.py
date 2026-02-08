@@ -4,9 +4,9 @@
     "version": "1.0",
     "category": "Hidden/Tests",
     "description": """A module to test the RPC requests.""",
-    "depends": ["base", "web"],
+    "depends": ["web", "rpc"],
     "installable": True,
-    "auto_install": False,
     "data": ["ir.model.access.csv"],
+    'author': 'Odoo S.A.',
     'license': 'LGPL-3',
 }

@@ -1,44 +1,76 @@
-# -*- coding: utf-8 -*-
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 
 """ Modules migration handling. """
+from __future__ import annotations
 
-from collections import defaultdict
 import glob
-import importlib.util
+import inspect
+import itertools
 import logging
 import os
+import re
+import typing
+from collections import defaultdict
 from os.path import join as opj
 
-from odoo.modules.module import get_resource_path
 import odoo.release as release
 import odoo.upgrade
+from odoo.modules.module import load_script
+from odoo.orm.registry import Registry
+from odoo.tools.misc import file_path
 from odoo.tools.parse_version import parse_version
+
+if typing.TYPE_CHECKING:
+    from collections.abc import Iterator
+    from odoo.sql_db import Cursor
+    from . import module_graph
 
 _logger = logging.getLogger(__name__)
 
 
-def load_script(path, module_name):
-    full_path = get_resource_path(*path.split(os.path.sep)) if not os.path.isabs(path) else path
-    spec = importlib.util.spec_from_file_location(module_name, full_path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+VERSION_RE = re.compile(
+    r"""^
+        # Optional prefix with Odoo version
+        ((
+            6\.1|
+
+            # "x.0" version, with x >= 6.
+            [6-9]\.0|
+
+            # multi digits "x.0" versions
+            [1-9]\d+\.0|
+
+            # x.saas~y, where x >= 7 and x <= 10
+            (7|8|9|10)\.saas~[1-9]\d*|
+
+            # saas~x.y, where x >= 11 and y between 1 and 9
+            # FIXME handle version >= saas~100 (expected in year 2106)
+            saas~(1[1-9]|[2-9]\d+)\.[1-9]
+        )\.)?
+        # After Odoo version we allow precisely 2 or 3 parts
+        # note this will also allow 0.0.0 which has a special meaning
+        \d+\.\d+(\.\d+)?
+    $""",
+    re.VERBOSE | re.ASCII,
+)
 
 
-class MigrationManager(object):
-    """
-        This class manage the migration of modules
-        Migrations files must be python files containing a `migrate(cr, installed_version)`
+class MigrationManager:
+    """ Manages the migration of modules.
+
+        Migrations files must be python files containing a ``migrate(cr, installed_version)``
         function. These files must respect a directory tree structure: A 'migrations' folder
         which contains a folder by version. Version can be 'module' version or 'server.module'
         version (in this case, the files will only be processed by this version of the server).
-        Python file names must start by `pre-` or `post-` and will be executed, respectively,
-        before and after the module initialisation. `end-` scripts are run after all modules have
+        Python file names must start by ``pre-`` or ``post-`` and will be executed, respectively,
+        before and after the module initialisation. ``end-`` scripts are run after all modules have
         been updated.
-        A special folder named `0.0.0` can contain scripts that will be run on any version change.
-        In `pre` stage, `0.0.0` scripts are run first, while in `post` and `end`, they are run last.
-        Example:
+
+        A special folder named ``0.0.0`` can contain scripts that will be run on any version change.
+        In `pre` stage, ``0.0.0`` scripts are run first, while in ``post`` and ``end``, they are run last.
+
+        Example::
+
             <moduledir>
             `-- migrations
                 |-- 1.0
@@ -54,37 +86,58 @@ class MigrationManager(object):
                 |   `-- end-invariants.py               # processed on all version update
                 `-- foo.py                              # not processed
     """
+    migrations: defaultdict[str, dict]
 
-    def __init__(self, cr, graph):
+    def __init__(self, cr: Cursor, graph: module_graph.ModuleGraph):
         self.cr = cr
         self.graph = graph
         self.migrations = defaultdict(dict)
         self._get_files()
 
-    def _get_files(self):
-        def _get_upgrade_path(pkg):
+    def _get_files(self) -> None:
+        def _get_upgrade_path(pkg: str) -> Iterator[str]:
             for path in odoo.upgrade.__path__:
                 upgrade_path = opj(path, pkg)
                 if os.path.exists(upgrade_path):
                     yield upgrade_path
 
-        def get_scripts(path):
+        def _verify_upgrade_version(path: str, version: str) -> bool:
+            full_path = opj(path, version)
+            if not os.path.isdir(full_path):
+                return False
+
+            if version == "tests":
+                return False
+
+            if not VERSION_RE.match(version):
+                _logger.warning("Invalid version for upgrade script %r", full_path)
+                return False
+
+            return True
+
+        def get_scripts(path: str) -> dict[str, list[str]]:
             if not path:
                 return {}
             return {
                 version: glob.glob(opj(path, version, '*.py'))
                 for version in os.listdir(path)
-                if os.path.isdir(opj(path, version))
+                if _verify_upgrade_version(path, version)
             }
 
+        def check_path(path: str) -> str:
+            try:
+                return file_path(path)
+            except FileNotFoundError:
+                return ''
+
         for pkg in self.graph:
-            if not (hasattr(pkg, 'update') or pkg.state == 'to upgrade' or
-                    getattr(pkg, 'load_state', None) == 'to upgrade'):
+            if pkg.load_state != 'to upgrade' and pkg.name not in Registry(self.cr.dbname)._force_upgrade_scripts:
                 continue
 
+
             self.migrations[pkg.name] = {
-                'module': get_scripts(get_resource_path(pkg.name, 'migrations')),
-                'module_upgrades': get_scripts(get_resource_path(pkg.name, 'upgrades')),
+                'module': get_scripts(check_path(pkg.name + '/migrations')),
+                'module_upgrades': get_scripts(check_path(pkg.name + '/upgrades')),
             }
 
             scripts = defaultdict(list)
@@ -93,26 +146,26 @@ class MigrationManager(object):
                     scripts[v].extend(s)
             self.migrations[pkg.name]["upgrade"] = scripts
 
-    def migrate_module(self, pkg, stage):
+    def migrate_module(self, pkg: module_graph.ModuleNode, stage: typing.Literal['pre', 'post', 'end']) -> None:
         assert stage in ('pre', 'post', 'end')
         stageformat = {
             'pre': '[>%s]',
             'post': '[%s>]',
             'end': '[$%s]',
         }
-        state = pkg.state if stage in ('pre', 'post') else getattr(pkg, 'load_state', None)
-
-        if not (hasattr(pkg, 'update') or state == 'to upgrade') or state == 'to install':
+        if pkg.load_state != 'to upgrade' and pkg.name not in Registry(self.cr.dbname)._force_upgrade_scripts:
             return
 
-        def convert_version(version):
-            if version.count('.') >= 2:
-                return version  # the version number already contains the server version
+        def convert_version(version: str) -> str:
+            if version == "0.0.0":
+                return version
+            if version.count(".") > 2:
+                return version  # the version number already contains the server version, see VERSION_RE for details
             return "%s.%s" % (release.major_version, version)
 
-        def _get_migration_versions(pkg, stage):
+        def _get_migration_versions(pkg, stage: str) -> list[str]:
             versions = sorted({
-                ver
+                ver: None
                 for lv in self.migrations[pkg.name].values()
                 for ver, lf in lv.items()
                 if lf
@@ -141,11 +194,11 @@ class MigrationManager(object):
                 key=os.path.basename,
             )
 
-        installed_version = getattr(pkg, 'load_version', pkg.installed_version) or ''
+        installed_version = pkg.load_version or ''
         parsed_installed_version = parse_version(installed_version)
-        current_version = parse_version(convert_version(pkg.data['version']))
+        current_version = parse_version(convert_version(pkg.manifest['version']))
 
-        def compare(version):
+        def compare(version: str) -> bool:
             if version == "0.0.0" and parsed_installed_version < current_version:
                 return True
 
@@ -163,27 +216,42 @@ class MigrationManager(object):
         versions = _get_migration_versions(pkg, stage)
         for version in versions:
             if compare(version):
-                strfmt = {'addon': pkg.name,
-                          'stage': stage,
-                          'version': stageformat[stage] % version,
-                          }
-
                 for pyfile in _get_migration_files(pkg, version, stage):
-                    name, ext = os.path.splitext(os.path.basename(pyfile))
-                    if ext.lower() != '.py':
-                        continue
-                    mod = None
-                    try:
-                        mod = load_script(pyfile, name)
-                        _logger.info('module %(addon)s: Running migration %(version)s %(name)s' % dict(strfmt, name=mod.__name__))
-                        migrate = mod.migrate
-                    except ImportError:
-                        _logger.exception('module %(addon)s: Unable to load %(stage)s-migration file %(file)s' % dict(strfmt, file=pyfile))
-                        raise
-                    except AttributeError:
-                        _logger.error('module %(addon)s: Each %(stage)s-migration file must have a "migrate(cr, installed_version)" function' % strfmt)
-                    else:
-                        migrate(self.cr, installed_version)
-                    finally:
-                        if mod:
-                            del mod
+                    exec_script(self.cr, installed_version, pyfile, pkg.name, stage, stageformat[stage] % version)
+
+
+VALID_MIGRATE_PARAMS = list(itertools.product(
+    ['cr', '_cr'],
+    ['version', '_version'],
+))
+
+def exec_script(cr, installed_version, pyfile, addon, stage, version=None):
+    version = version or installed_version
+    name, ext = os.path.splitext(os.path.basename(pyfile))
+    if ext.lower() != '.py':
+        return
+    try:
+        mod = load_script(pyfile, name)
+    except ImportError as e:
+        raise ImportError('module %(addon)s: Unable to load %(stage)s-migration file %(file)s' % dict(locals(), file=pyfile)) from e
+
+    if not hasattr(mod, 'migrate'):
+        raise AttributeError(
+            'module %(addon)s: Each %(stage)s-migration file must have a "migrate(cr, installed_version)" function, not found in %(file)s' % dict(
+                locals(),
+                file=pyfile,
+            ))
+
+    try:
+        sig = inspect.signature(mod.migrate)
+    except TypeError as e:
+        raise TypeError("module %(addon)s: `migrate` needs to be a function, got %(migrate)r" % dict(locals(), migrate=mod.migrate)) from e
+
+    if not (
+            tuple(sig.parameters.keys()) in VALID_MIGRATE_PARAMS
+        and all(p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) for p in sig.parameters.values())
+    ):
+        raise TypeError("module %(addon)s: `migrate`'s signature should be `(cr, version)`, %(func)s is %(sig)s" % dict(locals(), func=mod.migrate, sig=sig))
+
+    _logger.info('module %(addon)s: Running migration %(version)s %(name)s' % dict(locals(), name=mod.__name__))  # noqa: G002
+    mod.migrate(cr, installed_version)

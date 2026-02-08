@@ -1,7 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-from __future__ import print_function
-import argparse
 import os
 import requests
 import sys
@@ -10,10 +6,12 @@ import zipfile
 
 from . import Command
 
+
 class Deploy(Command):
     """Deploy a module on an Odoo instance"""
+
     def __init__(self):
-        super(Deploy, self).__init__()
+        super().__init__()
         self.session = requests.session()
 
     def deploy_module(self, module_path, url, login, password, db='', force=False):
@@ -52,7 +50,7 @@ class Deploy(Command):
         try:
             print("Zipping module directory...")
             with zipfile.ZipFile(temp, 'w') as zfile:
-                for root, dirs, files in os.walk(path):
+                for root, _dirs, files in os.walk(path):
                     for file in files:
                         file_path = os.path.join(root, file)
                         zfile.write(file_path, file_path.split(container).pop())
@@ -62,10 +60,7 @@ class Deploy(Command):
             raise
 
     def run(self, cmdargs):
-        parser = argparse.ArgumentParser(
-            prog="%s deploy" % sys.argv[0].split(os.path.sep)[-1],
-            description=self.__doc__
-        )
+        parser = self.parser
         parser.add_argument('path', help="Path of the module to deploy")
         parser.add_argument('url', nargs='?', help='Url of the server (default=http://localhost:8069)', default="http://localhost:8069")
         parser.add_argument('--db', dest='db', help='Database to use if server does not use db-filter.')

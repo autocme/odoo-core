@@ -1,42 +1,24 @@
-# -*- coding: utf-8 -*-
-# Part of Odoo. See LICENSE file for full copyright and licensing details.
-
 """The Odoo Exceptions module defines a few core exception types.
 
 Those types are understood by the RPC layer.
 Any other exception type bubbling until the RPC layer will be
 treated as a 'Server error'.
-
-.. note::
-    If you consider introducing new exceptions,
-    check out the :mod:`odoo.addons.test_exceptions` module.
 """
-
-import logging
-import warnings
-
-_logger = logging.getLogger(__name__)
 
 
 class UserError(Exception):
     """Generic error managed by the client.
 
     Typically when the user tries to do something that has no sense given the current
-    state of a record. Semantically comparable to the generic 400 HTTP status codes.
+    state of a record.
     """
+    http_status = 422  # Unprocessable Entity
 
     def __init__(self, message):
         """
         :param message: exception message and frontend modal content
         """
         super().__init__(message)
-
-    @property
-    def name(self):
-        warnings.warn(
-            "UserError attribute 'name' is a deprecated alias to args[0]",
-            DeprecationWarning)
-        return self.args[0]
 
 
 class RedirectWarning(Exception):
@@ -53,33 +35,44 @@ class RedirectWarning(Exception):
     def __init__(self, message, action, button_text, additional_context=None):
         super().__init__(message, action, button_text, additional_context)
 
-    # using this RedirectWarning won't crash if used as an UserError
-    @property
-    def name(self):
-        warnings.warn(
-            "RedirectWarning attribute 'name' is a deprecated alias to args[0]",
-            DeprecationWarning)
-        return self.args[0]
-
 
 class AccessDenied(UserError):
     """Login/password error.
 
     .. note::
 
-        No traceback.
+        Traceback only visible in the logs.
 
     .. admonition:: Example
 
         When you try to log with a wrong password.
     """
+    http_status = 403  # Forbidden
 
     def __init__(self, message="Access Denied"):
         super().__init__(message)
+        self.suppress_traceback()  # must be called in `except`s too
+
+    def suppress_traceback(self):
+        """
+        Remove the traceback, cause and context of the exception, hiding
+        where the exception occured but keeping the exception message.
+
+        This method must be called in all situations where we are about
+        to print this exception to the users.
+
+        It is OK to leave the traceback (thus to *not* call this method)
+        if the exception is only logged in the logs, as they are only
+        accessible by the system administrators.
+        """
         self.with_traceback(None)
-        self.__cause__ = None
         self.traceback = ('', '', '')
 
+        # During handling of the above exception, another exception occurred
+        self.__context__ = None
+
+        # The above exception was the direct cause of the following exception
+        self.__cause__ = None
 
 class AccessError(UserError):
     """Access rights error.
@@ -88,6 +81,7 @@ class AccessError(UserError):
 
         When you try to read a record that you are not allowed to.
     """
+    http_status = 403  # Forbidden
 
 
 class CacheMiss(KeyError):
@@ -109,6 +103,17 @@ class MissingError(UserError):
 
         When you try to write on a deleted record.
     """
+    http_status = 404  # Not Found
+
+
+class LockError(UserError):
+    """Record(s) could not be locked.
+
+    .. admonition:: Example
+
+        Code tried to lock records, but could not succeed.
+    """
+    http_status = 409  # Conflict
 
 
 class ValidationError(UserError):
@@ -120,21 +125,13 @@ class ValidationError(UserError):
     """
 
 
-# Deprecated exceptions, only kept for backward compatibility, may be
-# removed in the future *without* any further notice than the Deprecation
-# Warning.
+class ConcurrencyError(Exception):
+    """
+    Signal that two concurrent transactions tried to commit something
+    that violates some constraint. Signal that the transaction that
+    failed should be retried after a short delay, see
+    :func:`~odoo.service.model.retrying`.
 
-class except_orm(UserError):
-    def __init__(self, name, value=None):
-        warnings.warn("except_orm is a deprecated alias to UserError.", DeprecationWarning)
-        super().__init__(f"{name}: {value}")
-
-class Warning(UserError):
-    def __init__(self, *args, **kwargs):
-        warnings.warn("Warning is a deprecated alias to UserError.", DeprecationWarning)
-        super().__init__(*args, **kwargs)
-
-class QWebException(Exception):
-    def __init__(self, *args, **kwargs):
-        warnings.warn("qweb.QWebException is the exception you are looking for.", DeprecationWarning)
-        super().__init__(*args, **kwargs)
+    This exception is low-level and has very few use cases, it should
+    only be used if all alternatives are deemed worse.
+    """

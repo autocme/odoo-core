@@ -4,7 +4,7 @@ from odoo import api, fields, models
 
 
 class BaseModuleUpdate(models.TransientModel):
-    _name = "base.module.update"
+    _name = 'base.module.update'
     _description = "Update Module"
 
     updated = fields.Integer('Number of modules updated', readonly=True)
@@ -21,7 +21,7 @@ class BaseModuleUpdate(models.TransientModel):
         res = {
             'domain': str([]),
             'name': 'Modules',
-            'view_mode': 'tree,form',
+            'view_mode': 'list,form',
             'res_model': 'ir.module.module',
             'view_id': False,
             'type': 'ir.actions.act_window',

@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-from odoo import api, fields, models
+from odoo import fields, models
 
 
-class SourceModel(models.Model):
+class Test_Search_PanelSource_Model(models.Model):
     _name = 'test_search_panel.source_model'
     _description = 'Source Model'
 
@@ -13,17 +13,10 @@ class SourceModel(models.Model):
         'test_search_panel.category_target_model_no_parent_name')
     tag_ids = fields.Many2many(
         'test_search_panel.filter_target_model', 'rel_table', string="Tags")
-    computed_tag_ids = fields.Many2many(
-        'test_search_panel.filter_target_model', string="Computed Tags", compute="_compute_computed_tag_ids")
     tag_id = fields.Many2one('test_search_panel.filter_target_model', string="Tag")
 
-    @api.depends('tag_ids')
-    def _compute_computed_tag_ids(self):
-        for record in self:
-            record.computed_tag_ids = record.tag_ids
 
-
-class CategoryTargetModel(models.Model):
+class Test_Search_PanelCategory_Target_Model(models.Model):
     _name = 'test_search_panel.category_target_model'
     _order = 'name'
     _description = 'Category target model'
@@ -33,7 +26,7 @@ class CategoryTargetModel(models.Model):
     parent_name_id = fields.Many2one('test_search_panel.category_target_model')
 
 
-class CategoryTargetModelNoParentName(models.Model):
+class Test_Search_PanelCategory_Target_Model_No_Parent_Name(models.Model):
     _name = 'test_search_panel.category_target_model_no_parent_name'
     _order = 'id desc'
     _description = 'Category target model'
@@ -41,7 +34,7 @@ class CategoryTargetModelNoParentName(models.Model):
     name = fields.Char('Name', required=True)
 
 
-class FilterTargetModel(models.Model):
+class Test_Search_PanelFilter_Target_Model(models.Model):
     _name = 'test_search_panel.filter_target_model'
     _order = 'name'
     _description = 'Filter target model'

@@ -7,6 +7,7 @@ import re
 
 from odoo.tests import common
 from odoo.tools import html_escape as e
+from odoo.tools.misc import file_open
 
 directory = os.path.dirname(__file__)
 
@@ -130,7 +131,6 @@ class TestCurrencyExport(TestExport):
         self.assertEqual(
             converted, u'<span class="oe_currency_value">-\N{ZERO WIDTH NO-BREAK SPACE}0.12</span>'
                        u'\N{NO-BREAK SPACE}{symbol}'.format(
-                obj=obj,
                 symbol=currency.symbol
             ),)
 
@@ -145,7 +145,6 @@ class TestCurrencyExport(TestExport):
             converted,
                       u'{symbol}\N{NO-BREAK SPACE}'
                       u'<span class="oe_currency_value">0.12</span>'.format(
-                obj=obj,
                 symbol=currency.symbol
             ),)
 
@@ -161,7 +160,6 @@ class TestCurrencyExport(TestExport):
             converted,
                       u'<span class="oe_currency_value">0.12</span>'
                       u'\N{NO-BREAK SPACE}{symbol}'.format(
-                obj=obj,
                 symbol=currency.symbol
             ),)
 
@@ -219,7 +217,7 @@ class TestBinaryExport(TestBasicExport):
     def test_image(self):
         converter = self.env['ir.qweb.field.image']
 
-        with open(os.path.join(directory, 'test_vectors', 'image'), 'rb') as f:
+        with file_open(os.path.join(directory, 'test_vectors', 'image'), 'rb') as f:
             content = f.read()
 
         encoded_content = base64.b64encode(content)
@@ -228,13 +226,13 @@ class TestBinaryExport(TestBasicExport):
         self.assertEqual(
             value, u'<img src="data:image/jpeg;base64,%s">' % encoded_content.decode('ascii'))
 
-        with open(os.path.join(directory, 'test_vectors', 'pdf'), 'rb') as f:
+        with file_open(os.path.join(directory, 'test_vectors', 'pdf'), 'rb') as f:
             content = f.read()
 
         with self.assertRaises(ValueError):
             converter.value_to_html(base64.b64encode(content), {})
 
-        with open(os.path.join(directory, 'test_vectors', 'pptx'), 'rb') as f:
+        with file_open(os.path.join(directory, 'test_vectors', 'pptx'), 'rb') as f:
             content = f.read()
 
         with self.assertRaises(ValueError):
@@ -277,7 +275,7 @@ class TestDatetimeExport(TestBasicExport):
         value = converter('2011-05-03 11:12:13')
 
         # default lang/format is US
-        self.assertEqual(value, '05/03/2011 00:12:13')
+        self.assertEqual(value, '05/03/2011 12:12:13 AM')
 
     def test_custom_format(self):
         converter = self.get_converter('datetime')

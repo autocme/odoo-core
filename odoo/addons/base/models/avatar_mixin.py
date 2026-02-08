@@ -5,6 +5,7 @@ from base64 import b64encode
 from hashlib import sha512
 from odoo import models, fields, api
 from odoo.tools import html_escape, file_open
+from odoo.tools.misc import limited_field_access_token
 
 
 def get_hsl_from_seed(seed):
@@ -25,11 +26,11 @@ class AvatarMixin(models.AbstractModel):
     _avatar_name_field = "name"
 
     # all image fields are base64 encoded and PIL-supported
-    avatar_1920 = fields.Image("Avatar", max_width=1920, max_height=1920, compute="_compute_avatar_1920")
-    avatar_1024 = fields.Image("Avatar 1024", max_width=1024, max_height=1024, compute="_compute_avatar_1024")
-    avatar_512 = fields.Image("Avatar 512", max_width=512, max_height=512, compute="_compute_avatar_512")
-    avatar_256 = fields.Image("Avatar 256", max_width=256, max_height=256, compute="_compute_avatar_256")
-    avatar_128 = fields.Image("Avatar 128", max_width=128, max_height=128, compute="_compute_avatar_128")
+    avatar_1920 = fields.Image("Avatar", compute="_compute_avatar_1920")
+    avatar_1024 = fields.Image("Avatar 1024", compute="_compute_avatar_1024")
+    avatar_512 = fields.Image("Avatar 512", compute="_compute_avatar_512")
+    avatar_256 = fields.Image("Avatar 256", compute="_compute_avatar_256")
+    avatar_128 = fields.Image("Avatar 128", compute="_compute_avatar_128")
 
     def _compute_avatar(self, avatar_field, image_field):
         for record in self:
@@ -38,7 +39,7 @@ class AvatarMixin(models.AbstractModel):
                 if record.id and record[record._avatar_name_field]:
                     avatar = record._avatar_generate_svg()
                 else:
-                    avatar = record._avatar_get_placeholder()
+                    avatar = b64encode(record._avatar_get_placeholder())
             record[avatar_field] = avatar
 
     @api.depends(lambda self: [self._avatar_name_field, 'image_1920'])
@@ -76,4 +77,14 @@ class AvatarMixin(models.AbstractModel):
         return "base/static/img/avatar_grey.png"
 
     def _avatar_get_placeholder(self):
-        return b64encode(file_open(self._avatar_get_placeholder_path(), 'rb').read())
+        with file_open(self._avatar_get_placeholder_path(), 'rb') as f:
+            return f.read()
+
+    def _get_avatar_128_access_token(self):
+        """Return a scoped access token for the `avatar_128` field. The token can be
+        used with `ir_binary._find_record` to bypass access rights.
+
+        :rtype: str
+        """
+        self.ensure_one()
+        return limited_field_access_token(self, "avatar_128", scope="binary")

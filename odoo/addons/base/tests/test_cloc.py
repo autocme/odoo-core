@@ -106,10 +106,10 @@ SCSS_TEST = '''
 .o_content > .o_list_view > .table-responsive > .table {
     // List views always have the table-sm class, maybe we should remove
     // it (and consider it does not exist) and change the default table paddings
-    @include o-list-view-full-width-padding($base: $table-cell-padding-sm, $ratio: 2);
+    @include o-list-view-full-width-padding($base-x: $table-cell-padding-x-sm, $base-y: $table-cell-padding-y-sm, $ratio: 2);
     &:not(.o_list_table_grouped) {
         @include media-breakpoint-up(xl) {
-            @include o-list-view-full-width-padding($base: $table-cell-padding-sm, $ratio: 2.5);
+            @include o-list-view-full-width-padding($base-x: $table-cell-padding-x-sm, $base-y: $table-cell-padding-y-sm, $ratio: 2.5);
         }
     }
 
@@ -239,13 +239,7 @@ class TestClocParser(TransactionCase):
         py_count = cl.parse_py(PY_TEST_NO_RETURN)
         self.assertEqual(py_count, (2, 2))
         py_count = cl.parse_py(PY_TEST)
-        if self._python_version >= (3, 8, 0):
-            # Multi line str lineno return the begining of the str
-            # in python 3.8, it result in a different count for
-            # multi str used in expressions
-            self.assertEqual(py_count, (7, 16))
-        else:
-            self.assertEqual(py_count, (8, 16))
+        self.assertEqual(py_count, (7, 16))
         js_count = cl.parse_js(JS_TEST)
         self.assertEqual(js_count, (10, 17))
         css_count = cl.parse_css(CSS_TEST)

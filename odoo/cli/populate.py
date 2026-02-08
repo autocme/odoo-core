@@ -1,88 +1,75 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
-import time
-import fnmatch
 import logging
 import optparse
-import odoo
+import sys
+import time
+
+from odoo import api
+from odoo.modules.registry import Registry
+from odoo.tools import config
+from odoo.tools.populate import populate_models
 
 from . import Command
+
+DEFAULT_FACTOR = '10000'
+DEFAULT_SEPARATOR = '_'
+DEFAULT_MODELS = 'res.partner,product.template,account.move,sale.order,crm.lead,stock.picking,project.task'
+
 _logger = logging.getLogger(__name__)
 
 
 class Populate(Command):
+    """Populate database via duplication of existing data for testing/demo purposes"""
 
     def run(self, cmdargs):
-        parser = odoo.tools.config.parser
+        parser = config.parser
+        parser.prog = self.prog
         group = optparse.OptionGroup(parser, "Populate Configuration")
-        group.add_option("--size", dest="population_size",
-                        help="Populate database with auto-generated data. Value should be the population size: small, medium or large",
-                        default='small')
+        group.add_option("--factors", dest="factors",
+                         help="Comma separated list of factors for each model, or just a single factor."
+                              "(Ex: a factor of 3 means the given model will be copied 3 times, reaching 4x it's original size)"
+                              "The last factor is propagated to the remaining models without a factor.",
+                         default=DEFAULT_FACTOR)
         group.add_option("--models",
-                         dest='populate_models',
-                         help="Comma separated list of model or pattern (fnmatch)")
+                         dest='models_to_populate',
+                         help="Comma separated list of models",
+                         default=DEFAULT_MODELS)
+        group.add_option("--sep",
+                         dest='separator',
+                         help="Single character separator for char/text fields.",
+                         default=DEFAULT_SEPARATOR)
         parser.add_option_group(group)
-        opt = odoo.tools.config.parse_config(cmdargs)
-        populate_models = opt.populate_models and set(opt.populate_models.split(','))
-        population_size = opt.population_size
-        dbname = odoo.tools.config['db_name']
-        registry = odoo.registry(dbname)
-        with registry.cursor() as cr:
-            env = odoo.api.Environment(cr, odoo.SUPERUSER_ID, {})
-            self.populate(env, population_size, populate_models)
+        opt = config.parse_config(cmdargs + ['--no-http'], setup_logging=True)
 
-
-    @classmethod
-    def populate(cls, env, size, model_patterns=False):
-        registry = env.registry
-        populated_models = None
+        # deduplicate models if necessary, and keep the last corresponding
+        # factor for each model
+        opt_factors = [int(f) for f in opt.factors.split(',')]
+        model_factors = {
+            model_name: opt_factors[index] if index < len(opt_factors) else opt_factors[-1]
+            for index, model_name in enumerate(opt.models_to_populate.split(','))
+        }
         try:
-            registry.populated_models = {}  # todo master, initialize with already populated models
-            ordered_models = cls._get_ordered_models(env, model_patterns)
+            separator_code = ord(opt.separator)
+        except TypeError:
+            raise ValueError("Separator must be a single Unicode character.")
 
-            _logger.log(25, 'Populating database')
-            for model in ordered_models:
-                _logger.info('Populating database for model %s', model._name)
-                t0 = time.time()
-                registry.populated_models[model._name] = model._populate(size).ids
-                # todo indicate somewhere that model is populated
-                env.cr.commit()
-                model_time = time.time() - t0
-                if model_time > 1:
-                    _logger.info('Populated database for model %s (total: %fs) (average: %fms per record)',
-                                 model._name, model_time, model_time / len(registry.populated_models[model._name]) * 1000)
-        except:
-            _logger.exception('Something went wrong populating database')
-        finally:
-            populated_models = registry.populated_models
-            del registry.populated_models
-
-        return populated_models
+        dbnames = config['db_name']
+        if len(dbnames) > 1:
+            sys.exit("-d/--database/db_name has multiple database, please provide a single one")
+        registry = Registry(dbnames[0])
+        with registry.cursor() as cr:
+            env = api.Environment(cr, api.SUPERUSER_ID, {'active_test': False})
+            self.populate(env, model_factors, separator_code)
 
     @classmethod
-    def _get_ordered_models(cls, env, model_patterns=False):
-        _logger.info('Computing model order')
-        processed = set()
-        ordered_models = []
-        visited = set()
-        def add_model(model):
-            if model not in processed:
-                if model in visited:
-                    raise ValueError('Cyclic dependency detected for %s' % model)
-                visited.add(model)
-                for dep in model._populate_dependencies:
-                    add_model(env[dep])
-                ordered_models.append(model)
-                processed.add(model)
-        for model in env.values():
-            ir_model = env['ir.model'].search([('model', '=', model._name)])
-            if model_patterns and not any(fnmatch.fnmatch(model._name, match) for match in model_patterns):
-                continue
-            if model._transient or model._abstract:
-                continue
-            if not model_patterns and all(module.startswith('test_') for module in ir_model.modules.split(',')):
-                continue
-            add_model(model)
-
-        return ordered_models
+    def populate(cls, env: api.Environment, modelname_factors: dict[str, int], separator_code: int):
+        model_factors = {
+            model: factor
+            for model_name, factor in modelname_factors.items()
+            if (model := env.get(model_name)) is not None and not (model._transient or model._abstract)
+        }
+        _logger.log(25, 'Populating models %s', list(model_factors))
+        t0 = time.time()
+        populate_models(model_factors, separator_code)
+        env.flush_all()
+        model_time = time.time() - t0
+        _logger.info('Populated models %s (total: %fs)', list(model_factors), model_time)
