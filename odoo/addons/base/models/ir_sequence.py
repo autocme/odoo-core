@@ -3,10 +3,10 @@
 from datetime import datetime, timedelta
 import logging
 import pytz
-from psycopg2 import sql, OperationalError, errorcodes
 
 from odoo import api, fields, models, _
 from odoo.exceptions import UserError
+from odoo.tools import SQL
 
 _logger = logging.getLogger(__name__)
 
@@ -21,10 +21,12 @@ def _create_sequence(cr, seq_name, number_increment, number_next):
 
 def _drop_sequences(cr, seq_names):
     """ Drop the PostreSQL sequences if they exist. """
-    names = sql.SQL(',').join(map(sql.Identifier, seq_names))
+    if not seq_names:
+        return
+    names = SQL(',').join(map(SQL.identifier, seq_names))
     # RESTRICT is the default; it prevents dropping the sequence if an
     # object depends on it.
-    cr.execute(sql.SQL("DROP SEQUENCE IF EXISTS {} RESTRICT").format(names))
+    cr.execute(SQL("DROP SEQUENCE IF EXISTS %s RESTRICT", names))
 
 
 def _alter_sequence(cr, seq_name, number_increment=None, number_next=None):
@@ -35,15 +37,13 @@ def _alter_sequence(cr, seq_name, number_increment=None, number_next=None):
     if not cr.fetchone():
         # sequence is not created yet, we're inside create() so ignore it, will be set later
         return
-    statement = sql.SQL("ALTER SEQUENCE") + sql.Identifier(seq_name)
-    params = []
-    if number_increment is not None:
-        statement += sql.SQL("INCREMENT BY") + sql.Placeholder()
-        params.append(number_increment)
-    if number_next is not None:
-        statement += sql.SQL("RESTART WITH") + sql.Placeholder()
-        params.append(number_next)
-    cr.execute(statement.join(' '), params)
+    statement = SQL(
+        "ALTER SEQUENCE %s%s%s",
+        SQL.identifier(seq_name),
+        SQL(" INCREMENT BY %s", number_increment) if number_increment is not None else SQL(),
+        SQL(" RESTART WITH %s", number_next) if number_next is not None else SQL(),
+    )
+    cr.execute(statement)
 
 
 def _select_nextval(cr, seq_name):
@@ -52,29 +52,26 @@ def _select_nextval(cr, seq_name):
 
 
 def _update_nogap(self, number_increment):
+    self.flush_recordset(['number_next'])
     number_next = self.number_next
     self._cr.execute("SELECT number_next FROM %s WHERE id=%%s FOR UPDATE NOWAIT" % self._table, [self.id])
     self._cr.execute("UPDATE %s SET number_next=number_next+%%s WHERE id=%%s " % self._table, (number_increment, self.id))
-    self.invalidate_cache(['number_next'], [self.id])
+    self.invalidate_recordset(['number_next'])
     return number_next
 
 def _predict_nextval(self, seq_id):
     """Predict next value for PostgreSQL sequence without consuming it"""
     # Cannot use currval() as it requires prior call to nextval()
     seqname = 'ir_sequence_%s' % seq_id
-    seqtable = sql.Identifier(seqname)
-    query = sql.SQL("""SELECT last_value,
-                      (SELECT increment_by
-                       FROM pg_sequences
-                       WHERE sequencename = %s),
-                      is_called
-               FROM {}""")
-    params = [seqname]
+    seqtable = SQL.identifier(seqname)
+    query = SQL("""
+        SELECT last_value,
+            (SELECT increment_by FROM pg_sequences WHERE sequencename = %s),
+            is_called
+        FROM %s""", seqname, seqtable)
     if self.env.cr._cnx.server_version < 100000:
-        query = sql.SQL("SELECT last_value, increment_by, is_called FROM {}")
-        params = []
-    self.env.cr.execute(query.format(seqtable), params)
-    (last_value, increment_by, is_called) = self.env.cr.fetchone()
+        query = SQL("SELECT last_value, increment_by, is_called FROM %s", seqtable)
+    [(last_value, increment_by, is_called)] = self.env.execute_query(query)
     if is_called:
         return last_value + increment_by
     # sequence has just been RESTARTed to return last_value next time
@@ -151,14 +148,15 @@ class IrSequence(models.Model):
     use_date_range = fields.Boolean(string='Use subsequences per date_range')
     date_range_ids = fields.One2many('ir.sequence.date_range', 'sequence_id', string='Subsequences')
 
-    @api.model
-    def create(self, values):
+    @api.model_create_multi
+    def create(self, vals_list):
         """ Create a sequence, in implementation == standard a fast gaps-allowed PostgreSQL sequence is used.
         """
-        seq = super(IrSequence, self).create(values)
-        if values.get('implementation', 'standard') == 'standard':
-            _create_sequence(self._cr, "ir_sequence_%03d" % seq.id, values.get('number_increment', 1), values.get('number_next', 1))
-        return seq
+        seqs = super().create(vals_list)
+        for seq in seqs:
+            if seq.implementation == 'standard':
+                _create_sequence(self._cr, "ir_sequence_%03d" % seq.id, seq.number_increment or 1, seq.number_next or 1)
+        return seqs
 
     def unlink(self):
         _drop_sequences(self._cr, ["ir_sequence_%03d" % x.id for x in self])
@@ -192,7 +190,7 @@ class IrSequence(models.Model):
                         _create_sequence(self._cr, "ir_sequence_%03d_%03d" % (seq.id, sub_seq.id), i, n)
         res = super(IrSequence, self).write(values)
         # DLE P179
-        self.flush(values.keys())
+        self.flush_model(values.keys())
         return res
 
     def _next_do(self):
@@ -230,8 +228,8 @@ class IrSequence(models.Model):
         try:
             interpolated_prefix = _interpolate(self.prefix, d)
             interpolated_suffix = _interpolate(self.suffix, d)
-        except (ValueError, TypeError):
-            raise UserError(_('Invalid prefix or suffix for sequence \'%s\'') % self.name)
+        except (ValueError, TypeError, KeyError):
+            raise UserError(_('Invalid prefix or suffix for sequence “%s”', self.name))
         return interpolated_prefix, interpolated_suffix
 
     def get_next_char(self, number_next):
@@ -268,7 +266,7 @@ class IrSequence(models.Model):
 
     def next_by_id(self, sequence_date=None):
         """ Draw an interpolated string using the specified sequence."""
-        self.check_access_rights('read')
+        self.browse().check_access('read')
         return self._next(sequence_date=sequence_date)
 
     @api.model
@@ -278,7 +276,7 @@ class IrSequence(models.Model):
             (multi-company cases), the one from the user's current company will
             be used.
         """
-        self.check_access_rights('read')
+        self.browse().check_access('read')
         company_id = self.env.company.id
         seq_ids = self.search([('code', '=', sequence_code), ('company_id', 'in', [company_id, False])], order='company_id')
         if not seq_ids:
@@ -318,6 +316,14 @@ class IrSequenceDateRange(models.Model):
     _rec_name = "sequence_id"
     _allow_sudo_commands = False
 
+    _sql_constraints = [
+        (
+            'unique_range_per_sequence',
+            'UNIQUE(sequence_id, date_from, date_to)',
+            "You cannot create two date ranges for the same sequence with the same date range.",
+        ),
+    ]
+
     def _get_number_next_actual(self):
         '''Return number from ir_sequence row when no_gap implementation,
         and number from postgres sequence when standard implementation.'''
@@ -335,7 +341,8 @@ class IrSequenceDateRange(models.Model):
     @api.model
     def default_get(self, fields):
         result = super(IrSequenceDateRange, self).default_get(fields)
-        result['number_next_actual'] = 1
+        if 'number_next_actual' in fields:
+            result['number_next_actual'] = 1
         return result
 
     date_from = fields.Date(string='From', required=True)
@@ -358,15 +365,16 @@ class IrSequenceDateRange(models.Model):
         for seq in self:
             _alter_sequence(self._cr, "ir_sequence_%03d_%03d" % (seq.sequence_id.id, seq.id), number_increment=number_increment, number_next=number_next)
 
-    @api.model
-    def create(self, values):
+    @api.model_create_multi
+    def create(self, vals_list):
         """ Create a sequence, in implementation == standard a fast gaps-allowed PostgreSQL sequence is used.
         """
-        seq = super(IrSequenceDateRange, self).create(values)
-        main_seq = seq.sequence_id
-        if main_seq.implementation == 'standard':
-            _create_sequence(self._cr, "ir_sequence_%03d_%03d" % (main_seq.id, seq.id), main_seq.number_increment, values.get('number_next_actual', 1))
-        return seq
+        seqs = super().create(vals_list)
+        for seq in seqs:
+            main_seq = seq.sequence_id
+            if main_seq.implementation == 'standard':
+                _create_sequence(self._cr, "ir_sequence_%03d_%03d" % (main_seq.id, seq.id), main_seq.number_increment, seq.number_next_actual or 1)
+        return seqs
 
     def unlink(self):
         _drop_sequences(self._cr, ["ir_sequence_%03d_%03d" % (x.sequence_id.id, x.id) for x in self])
@@ -385,5 +393,5 @@ class IrSequenceDateRange(models.Model):
         #  - But selecting the number next happens a lot,
         # Therefore, if I chose to put the flush just above the select, it would check the flush most of the time for no reason.
         res = super(IrSequenceDateRange, self).write(values)
-        self.flush(values.keys())
+        self.flush_model(values.keys())
         return res

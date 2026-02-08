@@ -1,12 +1,12 @@
-# -*- coding: utf-8 -*-
-from odoo.tests.common import TransactionCase
-from odoo.exceptions import MissingError
 from odoo import Command
+from odoo.addons.base.tests.test_expression import TransactionExpressionCase
+from odoo.exceptions import MissingError, UserError
+from odoo.tools import mute_logger
 
 
-class One2manyCase(TransactionCase):
+class One2manyCase(TransactionExpressionCase):
     def setUp(self):
-        super(One2manyCase, self).setUp()
+        super().setUp()
         self.Line = self.env["test_new_api.multi.line"]
         self.multi = self.env["test_new_api.multi"].create({
             "name": "What is up?"
@@ -57,7 +57,7 @@ class One2manyCase(TransactionCase):
             return
         # Invalidate the cache and check again; this crashes if the value
         # of self.multi.lines in cache contains new records
-        self.multi.invalidate_cache()
+        self.env.invalidate_all()
         self.assertEqual(len(self.multi.lines), 9)
         self.assertIn("hello", self.multi.lines.mapped('name'))
 
@@ -126,28 +126,28 @@ class One2manyCase(TransactionCase):
         movie_editions = movies_with_edition.editions
         one_movie_edition = movie_editions[0]
 
-        res_movies_without_edition = self.Movie.search([('editions', '=', False)])
+        res_movies_without_edition = self._search(self.Movie, [('editions', '=', False)])
         self.assertItemsEqual(t(res_movies_without_edition), t(movies_without_edition))
 
-        res_movies_with_edition = self.Movie.search([('editions', '!=', False)])
+        res_movies_with_edition = self._search(self.Movie, [('editions', '!=', False)])
         self.assertItemsEqual(t(res_movies_with_edition), t(movies_with_edition))
 
-        res_books_with_movie_edition = self.Book.search([('editions', 'in', movie_editions.ids)])
+        res_books_with_movie_edition = self._search(self.Book, [('editions', 'in', movie_editions.ids)])
         self.assertFalse(t(res_books_with_movie_edition))
 
-        res_books_without_movie_edition = self.Book.search([('editions', 'not in', movie_editions.ids)])
+        res_books_without_movie_edition = self._search(self.Book, [('editions', 'not in', movie_editions.ids)])
         self.assertItemsEqual(t(res_books_without_movie_edition), t(books))
 
-        res_books_without_one_movie_edition = self.Book.search([('editions', 'not in', movie_editions[:1].ids)])
+        res_books_without_one_movie_edition = self._search(self.Book, [('editions', 'not in', movie_editions[:1].ids)])
         self.assertItemsEqual(t(res_books_without_one_movie_edition), t(books))
 
-        res_books_with_one_movie_edition_name = self.Book.search([('editions', '=', movie_editions[:1].name)])
+        res_books_with_one_movie_edition_name = self._search(self.Book, [('editions', '=', movie_editions[:1].name)])
         self.assertFalse(t(res_books_with_one_movie_edition_name))
 
-        res_books_without_one_movie_edition_name = self.Book.search([('editions', '!=', movie_editions[:1].name)])
+        res_books_without_one_movie_edition_name = self._search(self.Book, [('editions', '!=', movie_editions[:1].name)])
         self.assertItemsEqual(t(res_books_without_one_movie_edition_name), t(books))
 
-        res_movies_not_of_edition_name = self.Movie.search([('editions', '!=', one_movie_edition.name)])
+        res_movies_not_of_edition_name = self._search(self.Movie, [('editions', '!=', one_movie_edition.name)])
         self.assertItemsEqual(t(res_movies_not_of_edition_name), t(movies.filtered(lambda r: one_movie_edition not in r.editions)))
 
     def test_merge_partner(self):
@@ -188,6 +188,26 @@ class One2manyCase(TransactionCase):
         self.assertTrue(p2.exists())
         self.assertFalse(p3.exists())
 
+    def test_partner_merge_wizard_more_than_one_user_error(self):
+        """ Test that partners cannot be merged if linked to more than one user even if only one is active. """
+        p1, p2, dst_partner = self.env['res.partner'].create([{'name': f'test{idx + 1}'} for idx in range(3)])
+        u1, u2 = self.env['res.users'].create([{'name': 'test1', 'login': 'test1', 'partner_id': p1.id},
+                                               {'name': 'test2', 'login': 'test2', 'partner_id': p2.id}])
+        MergeWizard_with_context = self.env['base.partner.merge.automatic.wizard'].with_context(
+            active_ids=(u1.partner_id + u2.partner_id + dst_partner).ids, active_model='res.partner')
+
+        with self.assertRaises(UserError):
+            MergeWizard_with_context.create({}).action_merge()
+
+        u2.action_archive()
+        with self.assertRaises(UserError):
+            MergeWizard_with_context.create({}).action_merge()
+
+        u2.unlink()
+        MergeWizard_with_context.create({}).action_merge()
+        self.assertTrue(dst_partner.exists())
+        self.assertEqual(u1.partner_id.id, dst_partner.id)
+
     def test_cache_invalidation(self):
         """ Cache invalidation for one2many with integer inverse. """
         record0 = self.env['test_new_api.attachment.host'].create({})
@@ -199,7 +219,7 @@ class One2manyCase(TransactionCase):
             'res_model': record0._name,
             'res_id': record0.id,
         })
-        attachment.flush()
+        self.env.flush_all()
         with self.assertQueryCount(0):
             self.assertEqual(attachment.name, record0.display_name,
                              "field should be computed")
@@ -217,7 +237,7 @@ class One2manyCase(TransactionCase):
 
         # writing on res_id must recompute name and invalidate attachment_ids
         attachment.res_id = record1.id
-        attachment.flush()
+        self.env.flush_all()
         with self.assertQueryCount(0):
             self.assertEqual(attachment.name, record1.display_name,
                              "field should be recomputed")
@@ -258,6 +278,32 @@ class One2manyCase(TransactionCase):
         a = parent.child_ids[0]
         parent.write({'child_ids': [Command.link(a.id), Command.create({'name': 'B'})]})
 
+    def test_create_with_commands(self):
+        # create lines and warm up caches
+        order = self.env['test_new_api.order'].create({
+            'line_ids': [Command.create({'product': name}) for name in ('set', 'sept')],
+        })
+        line1, line2 = order.line_ids
+
+        # INSERT, UPDATE of line1
+        with self.assertQueryCount(2):
+            self.env['test_new_api.order'].create({
+                'line_ids': [Command.set(line1.ids)],
+            })
+
+        # INSERT order, INSERT thief, UPDATE of line1+line2
+        with self.assertQueryCount(3):
+            order = self.env['test_new_api.order'].create({
+                'line_ids': [Command.set(line1.ids)],
+            })
+            thief = self.env['test_new_api.order'].create({
+                'line_ids': [Command.set((line1 + line2).ids)],
+            })
+
+        # the lines have been stolen by thief
+        self.assertFalse(order.line_ids)
+        self.assertEqual(thief.line_ids, line1 + line2)
+
     def test_recomputation_ends(self):
         """ Regression test for neverending recomputation. """
         parent = self.env['test_new_api.model_parent_m2o'].create({'name': 'parent'})
@@ -266,7 +312,7 @@ class One2manyCase(TransactionCase):
 
         # delete parent, and check that recomputation ends
         parent.unlink()
-        parent.flush()
+        self.env.flush_all()
 
     def test_compute_stored_many2one_one2many(self):
         container = self.env['test_new_api.compute.container'].create({'name': 'Foo'})
@@ -275,6 +321,18 @@ class One2manyCase(TransactionCase):
         # at this point, member.container_id must be computed for member to
         # appear in container.member_ids
         self.assertEqual(container.member_ids, member)
+        self.assertEqual(container.member_count, 1)
+
+        # Changing member.name will trigger recomputing member.container_id,
+        # container.member_ids and container.member_count. Since we are setting
+        # the name to bar, it will be detached from container, resulting in a
+        # member_count of zero on the container.
+        member.name = 'Bar'
+        self.assertEqual(container.member_count, 0)
+
+        # Reattach member to container again
+        member.name = 'Foo'
+        self.assertEqual(container.member_count, 1)
 
     def test_reward_line_delete(self):
         order = self.env['test_new_api.order'].create({
@@ -303,6 +361,75 @@ class One2manyCase(TransactionCase):
                 'line_ids': [Command.link(line0.id), Command.link(line1.id)],
             })
 
+    def test_new_real_interactions(self):
+        """ Test and specify the interactions between new and real records.
+        Through m2o and o2m, with real/unreal records on both sides, the behavior
+        varies greatly.  At least, the behavior will be clearly consistent and any
+        change will have to adapt the current test.
+        """
+        ##############
+        # REAL - NEW #
+        ##############
+        parent = self.env['test_new_api.model_parent_m2o'].create({'name': 'parentB'})
+        new_child = self.env['test_new_api.model_child_m2o'].new({'name': 'B', 'parent_id': parent.id})
+
+        # wanted behavior: when creating a new with a real parent id, the child
+        # isn't present in the parent childs until true creation
+        self.assertFalse(parent.child_ids)
+        self.assertEqual(new_child.parent_id, parent)
+
+        # current (wanted?) behavior: when adding a new record to a real record
+        # o2m, the record is created, but not linked to the new in cache
+        # REAL.O2M += NEW RECORD
+        parent.child_ids += new_child
+        self.assertTrue(parent.child_ids)
+        self.assertNotEqual(parent.child_ids, new_child)
+
+        #############
+        # NEW - NEW #
+        #############
+        # wanted behavior: linking new records to new records is totally fine
+        new_parent = self.env['test_new_api.model_parent_m2o'].new({
+            "name": 'parentC3PO',
+            "child_ids": [(0, 0, {"name": "C3"})],
+        })
+        self.assertEqual(new_parent, new_parent.child_ids.parent_id)
+        self.assertFalse(new_parent.id)
+        self.assertTrue(new_parent.child_ids)
+        self.assertFalse(new_parent.child_ids.ids)
+
+        new_child = self.env['test_new_api.model_child_m2o'].new({
+            'name': 'PO',
+        })
+        new_parent.child_ids += new_child
+        self.assertIn(new_child, new_parent.child_ids)
+        self.assertEqual(len(new_parent.child_ids), 2)
+        self.assertListEqual(new_parent.child_ids.mapped('name'), ['C3', 'PO'])
+
+        new_child2 = self.env['test_new_api.model_child_m2o'].new({
+            'name': 'R2D2',
+            'parent_id': new_parent.id,
+        })
+        self.assertIn(new_child2, new_parent.child_ids)
+        self.assertEqual(len(new_parent.child_ids), 3)
+        self.assertListEqual(new_parent.child_ids.mapped('name'), ['C3', 'PO', 'R2D2'])
+
+        ###############################
+        # NEW TO REAL CONVERSION TEST #
+        ###############################
+
+        # A bit out of scope, but was interesting to check everything was
+        # working fine on the way.
+        name = type(new_parent).name
+        child_ids = type(new_parent).child_ids
+        parent = self.env['test_new_api.model_parent_m2o'].create({
+            'name': name.convert_to_write(new_parent.name, new_parent),
+            'child_ids': child_ids.convert_to_write(new_parent.child_ids, new_parent),
+        })
+        self.assertEqual(len(parent.child_ids), 3)
+        self.assertEqual(parent, parent.child_ids.parent_id)
+        self.assertEqual(parent.child_ids.mapped('name'), ['C3', 'PO', 'R2D2'])
+
     def test_parent_id(self):
         Team = self.env['test_new_api.team']
         Member = self.env['test_new_api.team.member']
@@ -325,5 +452,50 @@ class One2manyCase(TransactionCase):
         # Also, test a simple infinite loop if record is marked as a parent of itself
         team1.parent_id = team1.id
         # Check that the search is not stuck in the loop
-        Team.search([('id', 'parent_of', team1.id)])
-        Team.search([('id', 'child_of', team1.id)])
+        self._search(Team, [('id', 'parent_of', team1.id)])
+        self._search(Team, [('id', 'child_of', team1.id)])
+
+    @mute_logger('odoo.osv.expression')
+    def test_create_one2many_with_unsearchable_field(self):
+        # odoo.osv.expression is muted as reading a non-stored and unsearchable field will log an error and makes the runbot red
+
+        unsearchableO2M = self.env['test_new_api.unsearchable.o2m']
+
+        # Create a parent record
+        parent_record1 = unsearchableO2M.create({
+            'name': 'Parent 1',
+        })
+
+        # Create another parent record
+        parent_record2 = unsearchableO2M.create({
+            'name': 'Parent 2',
+        })
+
+        children = {parent_record1.id : [], parent_record2.id : []}
+        # Create child records linked to parent_record1
+        for i in range(5):
+            child = unsearchableO2M.create({
+                'name': f'Child {i}',
+                'stored_parent_id': parent_record1.id,
+                'parent_id': parent_record1.id,
+            })
+            self.assertEqual(child.parent_id, parent_record1)
+            children[parent_record1.id].append(child.id)
+
+        # Create child records linked to parent_record2
+        for i in range(5, 10):
+            child = unsearchableO2M.create({
+                'name': f'Child {i}',
+                'stored_parent_id': parent_record2.id,
+                'parent_id': parent_record2.id,
+            })
+            self.assertEqual(child.parent_id, parent_record2)
+            children[parent_record2.id].append(child.id)
+
+        # invalidating the cache to force reading one2many again
+        self.env.invalidate_all()
+        # Make sure the parent_record1 only has its own child records
+        self.assertEqual(parent_record1.child_ids.ids, children[parent_record1.id])
+
+        # Make sure the parent_record2 only has its own child records
+        self.assertEqual(parent_record2.child_ids.ids, children[parent_record2.id])

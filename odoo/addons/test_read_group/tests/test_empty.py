@@ -35,7 +35,7 @@ class TestEmptyDate(common.TransactionCase):
         self.assertEqual(gb, [{
             '__count': 3,
             '__domain': [('date', '=', False)],
-            '__range': {'date': False},
+            '__range': {'date:quarter': False},
             'date:quarter': False,
             'value': 6
         }])
@@ -61,3 +61,8 @@ class TestEmptyDate(common.TransactionCase):
             'date': 'December 1916',
             'value': 7,
         }])
+
+    def test_field_error(self):
+        Model = self.env['test_read_group.aggregate']
+        with self.assertRaisesRegex(ValueError, "Invalid field 'not_another_field' on model 'test_read_group.aggregate'"):
+            Model.read_group([], ['value', 'not_another_field'], ['partner_id', 'not_a_field'])

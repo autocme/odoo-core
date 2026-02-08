@@ -1,31 +1,44 @@
 # -*- coding: utf-8 -*-
 import base64
+import binascii
+from datetime import time
 import logging
+import math
 import re
 from io import BytesIO
 
 import babel
 import babel.dates
-from markupsafe import Markup, escape
+from markupsafe import Markup, escape, escape_silent
 from PIL import Image
 from lxml import etree, html
 
-from odoo import api, fields, models, _, _lt
-from odoo.tools import posix_to_ldml, float_utils, format_date, format_duration, pycompat
+from odoo import api, fields, models, tools
+from odoo.tools import posix_to_ldml, float_is_zero, float_utils, format_date, format_duration
 from odoo.tools.mail import safe_attrs
 from odoo.tools.misc import get_lang, babel_locale_parse
+from odoo.tools.mimetypes import guess_mimetype
+from odoo.tools.translate import _, LazyTranslate
 
+_lt = LazyTranslate(__name__)
 _logger = logging.getLogger(__name__)
 
 
-def nl2br(string):
-    """ Converts newlines to HTML linebreaks in ``string``. returns
-    the unicode result
-
-    :param str string:
-    :rtype: unicode
+def nl2br(string: str) -> Markup:
+    """ Converts newlines to HTML linebreaks in ``string`` after HTML-escaping
+    it.
     """
-    return pycompat.to_text(string).replace('\n', Markup('<br>\n'))
+    return escape_silent(string).replace('\n', Markup('<br>\n'))
+
+
+def nl2br_enclose(string: str, enclosure_tag: str = 'div') -> Markup:
+    """ Like nl2br, but returns enclosed Markup allowing to better manipulate
+    trusted and untrusted content. New lines added by use are trusted, other
+    content is escaped. """
+    return Markup('<{enclosure_tag}>{converted}</{enclosure_tag}>').format(
+        enclosure_tag=enclosure_tag,
+        converted=nl2br(string),
+    )
 
 #--------------------------------------------------------------------
 # QWeb Fields converters
@@ -104,7 +117,10 @@ class FieldConverter(models.AbstractModel):
         Converts a single value to its HTML version/output
         :rtype: unicode
         """
-        return escape(pycompat.to_text(value))
+        if value is None or value is False:
+            return ''
+
+        return escape(value.decode() if isinstance(value, bytes) else value)
 
     @api.model
     def record_to_html(self, record, field_name, options):
@@ -116,8 +132,8 @@ class FieldConverter(models.AbstractModel):
         """
         if not record:
             return False
-        value = record[field_name]
-        return False if value is False else record.env[self._name].value_to_html(value, options=options)
+        value = record.with_context(**self.env.context)[field_name]
+        return False if value is False else self.value_to_html(value, options=options)
 
     @api.model
     def user_lang(self):
@@ -128,7 +144,7 @@ class FieldConverter(models.AbstractModel):
 
         :returns: Model[res.lang]
         """
-        return get_lang(self.env)
+        return self.env['res.lang'].browse(get_lang(self.env).id)
 
 
 class IntegerConverter(models.AbstractModel):
@@ -137,8 +153,19 @@ class IntegerConverter(models.AbstractModel):
     _inherit = 'ir.qweb.field'
 
     @api.model
+    def get_available_options(self):
+        options = super(IntegerConverter, self).get_available_options()
+        options.update(
+            format_decimalized_number=dict(type='boolean', string=_('Decimalized number')),
+            precision_digits=dict(type='integer', string=_('Precision Digits')),
+        )
+        return options
+
+    @api.model
     def value_to_html(self, value, options):
-        return pycompat.to_text(self.user_lang().format('%d', value, grouping=True).replace(r'-', '-\N{ZERO WIDTH NO-BREAK SPACE}'))
+        if options.get('format_decimalized_number'):
+            return tools.misc.format_decimalized_number(value, options.get('precision_digits', 1))
+        return self.user_lang().format('%d', value, grouping=True).replace(r'-', '-\N{ZERO WIDTH NO-BREAK SPACE}')
 
 
 class FloatConverter(models.AbstractModel):
@@ -156,33 +183,40 @@ class FloatConverter(models.AbstractModel):
 
     @api.model
     def value_to_html(self, value, options):
+        min_precision = options.get('min_precision')
         if 'decimal_precision' in options:
             precision = self.env['decimal.precision'].precision_get(options['decimal_precision'])
+        elif options.get('precision') is None:
+            int_digits = int(math.log10(abs(value))) + 1 if value != 0 else 1
+            max_dec_digits = max(15 - int_digits, 0)
+            # We display maximum 6 decimal digits or the number of significant decimal digits if it's lower
+            precision = min(6, max_dec_digits)
+            min_precision = min_precision or 1
         else:
             precision = options['precision']
 
-        if precision is None:
-            fmt = '%f'
-        else:
-            value = float_utils.float_round(value, precision_digits=precision)
-            fmt = '%.{precision}f'.format(precision=precision)
+        fmt = f'%.{precision}f'
+        if min_precision and min_precision < precision:
+            _, dec_part = float_utils.float_split_str(value, precision)
+            digits_count = len(dec_part.rstrip('0'))
+            if digits_count < min_precision:
+                fmt = f'%.{min_precision}f'
+            elif digits_count < precision:
+                fmt = f'%.{digits_count}f'
 
-        formatted = self.user_lang().format(fmt, value, grouping=True).replace(r'-', '-\N{ZERO WIDTH NO-BREAK SPACE}')
-
-        # %f does not strip trailing zeroes. %g does but its precision causes
-        # it to switch to scientific notation starting at a million *and* to
-        # strip decimals. So use %f and if no precision was specified manually
-        # strip trailing 0.
-        if precision is None:
-            formatted = re.sub(r'(?:(0|\d+?)0+)$', r'\1', formatted)
-
-        return pycompat.to_text(formatted)
+        value = float_utils.float_round(value, precision_digits=precision)
+        return self.user_lang().format(fmt, value, grouping=True).replace(r'-', '-\N{ZERO WIDTH NO-BREAK SPACE}')
 
     @api.model
     def record_to_html(self, record, field_name, options):
         if 'precision' not in options and 'decimal_precision' not in options:
             _, precision = record._fields[field_name].get_digits(record.env) or (None, None)
             options = dict(options, precision=precision)
+        if 'min_precision' not in options:
+            field = record._fields[field_name]
+            if hasattr(field, 'get_min_display_digits'):
+                min_precision = field.get_min_display_digits(record.env)
+                options = dict(options, min_precision=min_precision)
         return super(FloatConverter, self).record_to_html(record, field_name, options)
 
 
@@ -225,30 +259,29 @@ class DateTimeConverter(models.AbstractModel):
     def value_to_html(self, value, options):
         if not value:
             return ''
-        options = options or {}
 
         lang = self.user_lang()
         locale = babel_locale_parse(lang.code)
-        format_func = babel.dates.format_datetime
         if isinstance(value, str):
             value = fields.Datetime.from_string(value)
 
-        value = fields.Datetime.context_timestamp(self, value)
-
         if options.get('tz_name'):
+            self = self.with_context(tz=options['tz_name'])
             tzinfo = babel.dates.get_timezone(options['tz_name'])
         else:
             tzinfo = None
+
+        value = fields.Datetime.context_timestamp(self, value)
 
         if 'format' in options:
             pattern = options['format']
         else:
             if options.get('time_only'):
-                strftime_pattern = ("%s" % (lang.time_format))
+                strftime_pattern = lang.time_format
             elif options.get('date_only'):
-                strftime_pattern = ("%s" % (lang.date_format))
+                strftime_pattern = lang.date_format
             else:
-                strftime_pattern = ("%s %s" % (lang.date_format, lang.time_format))
+                strftime_pattern = "%s %s" % (lang.date_format, lang.time_format)
 
             pattern = posix_to_ldml(strftime_pattern, locale=locale)
 
@@ -256,13 +289,11 @@ class DateTimeConverter(models.AbstractModel):
             pattern = pattern.replace(":ss", "").replace(":s", "")
 
         if options.get('time_only'):
-            format_func = babel.dates.format_time
-            return pycompat.to_text(format_func(value, format=pattern, tzinfo=tzinfo, locale=locale))
-        if options.get('date_only'):
-            format_func = babel.dates.format_date
-            return pycompat.to_text(format_func(value, format=pattern, locale=locale))
-
-        return pycompat.to_text(format_func(value, format=pattern, tzinfo=tzinfo, locale=locale))
+            return babel.dates.format_time(value, format=pattern, tzinfo=tzinfo, locale=locale)
+        elif options.get('date_only'):
+            return babel.dates.format_date(value, format=pattern, locale=locale)
+        else:
+            return babel.dates.format_datetime(value, format=pattern, tzinfo=tzinfo, locale=locale)
 
 
 class TextConverter(models.AbstractModel):
@@ -275,7 +306,7 @@ class TextConverter(models.AbstractModel):
         """
         Escapes the value and converts newlines to br. This is bullshit.
         """
-        return nl2br(escape(value)) if value else ''
+        return nl2br(value) if value else ''
 
 
 class SelectionConverter(models.AbstractModel):
@@ -289,13 +320,16 @@ class SelectionConverter(models.AbstractModel):
         options.update(
             selection=dict(type='selection', string=_('Selection'), description=_('By default the widget uses the field information'), required=True)
         )
+        options.update(
+            selection=dict(type='json', string=_('Json'), description=_('By default the widget uses the field information'), required=True)
+        )
         return options
 
     @api.model
     def value_to_html(self, value, options):
         if not value:
             return ''
-        return escape(pycompat.to_text(options['selection'][value]) or '')
+        return escape(options['selection'][value] or '')
 
     @api.model
     def record_to_html(self, record, field_name, options):
@@ -316,7 +350,7 @@ class ManyToOneConverter(models.AbstractModel):
         value = value.sudo().display_name
         if not value:
             return False
-        return nl2br(escape(value))
+        return nl2br(value)
 
 
 class ManyToManyConverter(models.AbstractModel):
@@ -329,7 +363,20 @@ class ManyToManyConverter(models.AbstractModel):
         if not value:
             return False
         text = ', '.join(value.sudo().mapped('display_name'))
-        return nl2br(escape(text))
+        return nl2br(text)
+
+
+class OneToManyConverter(models.AbstractModel):
+    _name = 'ir.qweb.field.one2many'
+    _description = 'Qweb field one2many'
+    _inherit = 'ir.qweb.field'
+
+    @api.model
+    def value_to_html(self, value, options):
+        if not value:
+            return False
+        text = ', '.join(value.sudo().mapped('display_name'))
+        return nl2br(text)
 
 
 class HTMLConverter(models.AbstractModel):
@@ -346,7 +393,7 @@ class HTMLConverter(models.AbstractModel):
         for element in body.iter():
             if element.attrib:
                 attrib = dict(element.attrib)
-                attrib = irQweb._post_processing_att(element.tag, attrib, options.get('template_options'))
+                attrib = irQweb._post_processing_att(element.tag, attrib)
                 element.attrib.clear()
                 element.attrib.update(attrib)
         return Markup(etree.tostring(body, encoding='unicode', method='html')[6:-7])
@@ -367,19 +414,29 @@ class ImageConverter(models.AbstractModel):
 
     @api.model
     def _get_src_data_b64(self, value, options):
-        try: # FIXME: maaaaaybe it could also take raw bytes?
-            image = Image.open(BytesIO(base64.b64decode(value)))
-            image.verify()
-        except IOError:
-            raise ValueError("Non-image binary fields can not be converted to HTML")
-        except: # image.verify() throws "suitable exceptions", I have no idea what they are
-            raise ValueError("Invalid image content")
+        try:
+            img_b64 = base64.b64decode(value)
+        except binascii.Error:
+            raise ValueError("Invalid image content") from None
 
-        return "data:%s;base64,%s" % (Image.MIME[image.format], value.decode('ascii'))
+        mimetype = guess_mimetype(img_b64, '') if img_b64 else None
+        if mimetype == 'image/webp':
+            return self.env["ir.qweb"]._get_converted_image_data_uri(value)
+        elif mimetype != "image/svg+xml":
+            try:
+                image = Image.open(BytesIO(img_b64))
+                image.verify()
+                mimetype = Image.MIME[image.format]
+            except OSError as exc:
+                raise ValueError("Non-image binary fields can not be converted to HTML") from exc
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError("Invalid image content") from exc
+
+        return "data:%s;base64,%s" % (mimetype, value.decode('ascii'))
 
     @api.model
     def value_to_html(self, value, options):
-        return Markup('<img src="%s">' % self._get_src_data_b64(value, options))
+        return Markup('<img src="%s">') % self._get_src_data_b64(value, options)
 
 class ImageUrlConverter(models.AbstractModel):
     """ ``image_url`` widget rendering, inserts an image tag in the
@@ -434,7 +491,7 @@ class MonetaryConverter(models.AbstractModel):
         # lang.format will not set one by default. currency.round will not
         # provide one either. So we need to generate a precision value
         # (integer > 0) from the currency's rounding (a float generally < 1.0).
-        fmt = "%.{0}f".format(display_currency.decimal_places)
+        fmt = "%.{0}f".format(options.get('decimal_places', display_currency.decimal_places))
 
         if options.get('from_currency'):
             date = options.get('date') or fields.Date.today()
@@ -445,9 +502,12 @@ class MonetaryConverter(models.AbstractModel):
                 company = self.env.company
             value = options['from_currency']._convert(value, display_currency, company, date)
 
+        if float_is_zero(value, precision_digits=display_currency.decimal_places):
+            value = 0.0
+
         lang = self.user_lang()
-        formatted_amount = lang.format(fmt, display_currency.round(value),
-                                grouping=True, monetary=True).replace(r' ', '\N{NO-BREAK SPACE}').replace(r'-', '-\N{ZERO WIDTH NO-BREAK SPACE}')
+        formatted_amount = lang.format(fmt, display_currency.round(value), grouping=True)\
+            .replace(r' ', '\N{NO-BREAK SPACE}').replace(r'-', '-\N{ZERO WIDTH NO-BREAK SPACE}')
 
         pre = post = ''
         if display_currency.position == 'before':
@@ -509,6 +569,32 @@ class FloatTimeConverter(models.AbstractModel):
     @api.model
     def value_to_html(self, value, options):
         return format_duration(value)
+
+
+class TimeConverter(models.AbstractModel):
+    """ ``time`` converter, to display integer or fractional value as
+    human-readable time (e.g. 1.5 as "1:30 AM"). The unit of this value
+    is in hours.
+
+    Can be used on any numerical field between: 0 <= value < 24
+    """
+    _name = 'ir.qweb.field.time'
+    _description = 'QWeb Field Time'
+    _inherit = 'ir.qweb.field'
+
+    @api.model
+    def value_to_html(self, value, options):
+        if value < 0:
+            raise ValueError(_("The value (%s) passed should be positive", value))
+        hours, minutes = divmod(int(abs(value) * 60), 60)
+        if hours > 23:
+            raise ValueError(_("The hour must be between 0 and 23"))
+        t = time(hour=hours, minute=minutes)
+
+        locale = babel_locale_parse(self.user_lang().code)
+        pattern = options.get('format', 'short')
+
+        return babel.dates.format_time(t, format=pattern, tzinfo=None, locale=locale)
 
 
 class DurationConverter(models.AbstractModel):
@@ -590,13 +676,26 @@ class DurationConverter(models.AbstractModel):
             v, r = divmod(r, secs_per_unit)
             if not v:
                 continue
-            section = babel.dates.format_timedelta(
-                v*secs_per_unit,
-                granularity=round_to,
-                add_direction=options.get('add_direction'),
-                format=options.get('format', 'long'),
-                threshold=1,
-                locale=locale)
+            try:
+                section = babel.dates.format_timedelta(
+                    v*secs_per_unit,
+                    granularity=round_to,
+                    add_direction=options.get('add_direction'),
+                    format=options.get('format', 'long'),
+                    threshold=1,
+                    locale=locale)
+            except KeyError:
+                # in case of wrong implementation of babel, try to fallback on en_US locale.
+                # https://github.com/python-babel/babel/pull/827/files
+                # Some bugs already fixed in 2.10 but ubuntu22 is 2.8
+                localeUS = babel_locale_parse('en_US')
+                section = babel.dates.format_timedelta(
+                    v*secs_per_unit,
+                    granularity=round_to,
+                    add_direction=options.get('add_direction'),
+                    format=options.get('format', 'long'),
+                    threshold=1,
+                    locale=localeUS)
             if section:
                 sections.append(section)
 
@@ -628,7 +727,7 @@ class RelativeDatetimeConverter(models.AbstractModel):
         # value should be a naive datetime in UTC. So is fields.Datetime.now()
         reference = fields.Datetime.from_string(options['now'])
 
-        return pycompat.to_text(babel.dates.format_timedelta(value - reference, add_direction=True, locale=locale))
+        return babel.dates.format_timedelta(value - reference, add_direction=True, locale=locale)
 
     @api.model
     def record_to_html(self, record, field_name, options):
@@ -663,6 +762,8 @@ class BarcodeConverter(models.AbstractModel):
     def value_to_html(self, value, options=None):
         if not value:
             return ''
+        if not bool(re.match(r'^[\x00-\x7F]+$', value)):
+            return nl2br(value)
         barcode_symbology = options.get('symbology', 'Code128')
         barcode = self.env['ir.actions.report'].barcode(
             barcode_symbology,
@@ -674,7 +775,7 @@ class BarcodeConverter(models.AbstractModel):
             if k.startswith('img_') and k[4:] in safe_attrs:
                 img_element.set(k[4:], v)
         if not img_element.get('alt'):
-            img_element.set('alt', _('Barcode %s') % value)
+            img_element.set('alt', _('Barcode %s', value))
         img_element.set('src', 'data:image/png;base64,%s' % base64.b64encode(barcode).decode())
         return Markup(html.tostring(img_element, encoding='unicode'))
 
@@ -713,30 +814,35 @@ class Contact(models.AbstractModel):
     @api.model
     def value_to_html(self, value, options):
         if not value:
+            if options.get('null_text'):
+                val = {
+                    'options': options,
+                }
+                template_options = options.get('template_options', {})
+                return self.env['ir.qweb']._render('base.no_contact', val, **template_options)
             return ''
 
         opf = options.get('fields') or ["name", "address", "phone", "mobile", "email"]
         sep = options.get('separator')
-        template_options = options.get('template_options', {})
         if sep:
             opsep = escape(sep)
-        elif template_options.get('no_tag_br'):
+        elif options.get('no_tag_br'):
             # escaped joiners will auto-escape joined params
             opsep = escape(', ')
         else:
             opsep = Markup('<br/>')
 
         value = value.sudo().with_context(show_address=True)
-        name_get = value.name_get()[0][1]
+        display_name = value.display_name or ''
         # Avoid having something like:
-        # name_get = 'Foo\n  \n' -> This is a res.partner with a name and no address
+        # display_name = 'Foo\n  \n' -> This is a res.partner with a name and no address
         # That would return markup('<br/>') as address. But there is no address set.
-        if any(elem.strip() for elem in name_get.split("\n")[1:]):
-            address = opsep.join(name_get.split("\n")[1:]).strip()
+        if any(elem.strip() for elem in display_name.split("\n")[1:]):
+            address = opsep.join(display_name.split("\n")[1:]).strip()
         else:
             address = ''
         val = {
-            'name': name_get.split("\n")[0],
+            'name': display_name.split("\n")[0],
             'address': address,
             'phone': value.phone,
             'mobile': value.mobile,
@@ -750,7 +856,7 @@ class Contact(models.AbstractModel):
             'object': value,
             'options': options
         }
-        return self.env['ir.qweb']._render('base.contact', val, **template_options)
+        return self.env['ir.qweb']._render('base.contact', val, minimal_qcontext=True)
 
 
 class QwebView(models.AbstractModel):
@@ -768,4 +874,4 @@ class QwebView(models.AbstractModel):
             _logger.warning("%s.%s must be a 'ir.ui.view', got %r.", record, field_name, view._name)
             return ''
 
-        return view._render(options.get('values', {}), engine='ir.qweb')
+        return self.env['ir.qweb']._render(view.id, options.get('values', {}))

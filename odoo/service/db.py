@@ -4,33 +4,44 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import tempfile
-import threading
-import traceback
-from xml.etree import ElementTree as ET
 import zipfile
 
-from psycopg2 import sql
-from pytz import country_timezones
-from functools import wraps
 from contextlib import closing
-from decorator import decorator
+from datetime import datetime
+from xml.etree import ElementTree as ET
 
 import psycopg2
+from psycopg2.extensions import quote_ident
+from decorator import decorator
+from pytz import country_timezones
 
 import odoo
-from odoo import SUPERUSER_ID
-from odoo.exceptions import AccessDenied
 import odoo.release
 import odoo.sql_db
 import odoo.tools
-from odoo.sql_db import db_connect
+from odoo import SUPERUSER_ID
+from odoo.exceptions import AccessDenied
 from odoo.release import version_info
+from odoo.sql_db import db_connect
+from odoo.tools import SQL
+from odoo.tools.misc import exec_pg_environ, find_pg_tool
 
 _logger = logging.getLogger(__name__)
 
+
 class DatabaseExists(Warning):
     pass
+
+
+def database_identifier(cr, name: str) -> SQL:
+    """Quote a database identifier.
+
+    Use instead of `SQL.identifier` to accept all kinds of identifiers.
+    """
+    name = quote_ident(name, cr._cnx)
+    return SQL(name)
 
 
 def check_db_management_enabled(method):
@@ -89,10 +100,33 @@ def _initialize_db(id, db_name, demo, lang, user_password, login='admin', countr
                     values['email'] = emails[0]
             env.ref('base.user_admin').write(values)
 
-            cr.execute('SELECT login, password FROM res_users ORDER BY login')
             cr.commit()
     except Exception as e:
         _logger.exception('CREATE DATABASE failed:')
+
+
+def _check_faketime_mode(db_name):
+    if os.getenv('ODOO_FAKETIME_TEST_MODE') and db_name in odoo.tools.config['db_name'].split(','):
+        try:
+            db = odoo.sql_db.db_connect(db_name)
+            with db.cursor() as cursor:
+                cursor.execute("SELECT (pg_catalog.now() AT TIME ZONE 'UTC');")
+                server_now = cursor.fetchone()[0]
+                time_offset = (datetime.now() - server_now).total_seconds()
+
+                cursor.execute("""
+                    CREATE OR REPLACE FUNCTION public.now()
+                        RETURNS timestamp with time zone AS $$
+                            SELECT pg_catalog.now() +  %s * interval '1 second';
+                        $$ LANGUAGE sql;
+                """, (int(time_offset), ))
+                cursor.execute("SELECT (now() AT TIME ZONE 'UTC');")
+                new_now = cursor.fetchone()[0]
+                _logger.info("Faketime mode, new cursor now is %s", new_now)
+                cursor.commit()
+        except psycopg2.Error as e:
+            _logger.warning("Unable to set fakedtimed NOW() : %s", e)
+
 
 def _create_empty_database(name):
     db = odoo.sql_db.db_connect('postgres')
@@ -101,6 +135,7 @@ def _create_empty_database(name):
         cr.execute("SELECT datname FROM pg_database WHERE datname = %s",
                    (name,), log_exceptions=False)
         if cr.fetchall():
+            _check_faketime_mode(name)
             raise DatabaseExists("database %r already exists!" % (name,))
         else:
             # database-altering operations cannot be executed inside a transaction
@@ -108,20 +143,38 @@ def _create_empty_database(name):
             cr._cnx.autocommit = True
 
             # 'C' collate is only safe with template0, but provides more useful indexes
-            collate = sql.SQL("LC_COLLATE 'C'" if chosen_template == 'template0' else "")
-            cr.execute(
-                sql.SQL("CREATE DATABASE {} ENCODING 'unicode' {} TEMPLATE {}").format(
-                sql.Identifier(name), collate, sql.Identifier(chosen_template)
+            cr.execute(SQL(
+                "CREATE DATABASE %s ENCODING 'unicode' %s TEMPLATE %s",
+                database_identifier(cr, name),
+                SQL("LC_COLLATE 'C'") if chosen_template == 'template0' else SQL(""),
+                database_identifier(cr, chosen_template),
             ))
 
-    if odoo.tools.config['unaccent']:
-        try:
-            db = odoo.sql_db.db_connect(name)
-            with closing(db.cursor()) as cr:
+    # TODO: add --extension=trigram,unaccent
+    try:
+        db = odoo.sql_db.db_connect(name)
+        with db.cursor() as cr:
+            cr.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+            if odoo.tools.config['unaccent']:
                 cr.execute("CREATE EXTENSION IF NOT EXISTS unaccent")
-                cr.commit()
-        except psycopg2.Error:
-            pass
+                # From PostgreSQL's point of view, making 'unaccent' immutable is incorrect
+                # because it depends on external data - see
+                # https://www.postgresql.org/message-id/flat/201012021544.oB2FiTn1041521@wwwmaster.postgresql.org#201012021544.oB2FiTn1041521@wwwmaster.postgresql.org
+                # But in the case of Odoo, we consider that those data don't
+                # change in the lifetime of a database. If they do change, all
+                # indexes created with this function become corrupted!
+                cr.execute("ALTER FUNCTION unaccent(text) IMMUTABLE")
+    except psycopg2.Error as e:
+        _logger.warning("Unable to create PostgreSQL extensions : %s", e)
+    _check_faketime_mode(name)
+
+    # restore legacy behaviour on pg15+
+    try:
+        db = odoo.sql_db.db_connect(name)
+        with db.cursor() as cr:
+            cr.execute("GRANT CREATE ON SCHEMA PUBLIC TO PUBLIC")
+    except psycopg2.Error as e:
+        _logger.warning("Unable to make public schema public-accessible: %s", e)
 
 @check_db_management_enabled
 def exp_create_database(db_name, demo, lang, user_password='admin', login='admin', country_code=None, phone=None):
@@ -132,7 +185,7 @@ def exp_create_database(db_name, demo, lang, user_password='admin', login='admin
     return True
 
 @check_db_management_enabled
-def exp_duplicate_database(db_original_name, db_name):
+def exp_duplicate_database(db_original_name, db_name, neutralize_database=False):
     _logger.info('Duplicate database `%s` to `%s`.', db_original_name, db_name)
     odoo.sql_db.close_db(db_original_name)
     db = odoo.sql_db.db_connect('postgres')
@@ -140,9 +193,10 @@ def exp_duplicate_database(db_original_name, db_name):
         # database-altering operations cannot be executed inside a transaction
         cr._cnx.autocommit = True
         _drop_conn(cr, db_original_name)
-        cr.execute(sql.SQL("CREATE DATABASE {} ENCODING 'unicode' TEMPLATE {}").format(
-            sql.Identifier(db_name),
-            sql.Identifier(db_original_name)
+        cr.execute(SQL(
+            "CREATE DATABASE %s ENCODING 'unicode' TEMPLATE %s",
+            database_identifier(cr, db_name),
+            database_identifier(cr, db_original_name),
         ))
 
     registry = odoo.modules.registry.Registry.new(db_name)
@@ -150,6 +204,8 @@ def exp_duplicate_database(db_original_name, db_name):
         # if it's a copy of a database, force generation of a new dbuuid
         env = odoo.api.Environment(cr, SUPERUSER_ID, {})
         env['ir.config_parameter'].init(force=True)
+        if neutralize_database:
+            odoo.modules.neutralize.neutralize_database(cr)
 
     from_fs = odoo.tools.config.filestore(db_original_name)
     to_fs = odoo.tools.config.filestore(db_name)
@@ -187,7 +243,7 @@ def exp_drop(db_name):
         _drop_conn(cr, db_name)
 
         try:
-            cr.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(db_name)))
+            cr.execute(SQL('DROP DATABASE %s', database_identifier(cr, db_name)))
         except Exception as e:
             _logger.info('DROP DB: %s failed:\n%s', db_name, e)
             raise Exception("Couldn't drop database %s: %s" % (db_name, e))
@@ -229,8 +285,8 @@ def dump_db(db_name, stream, backup_format='zip'):
 
     _logger.info('DUMP DB: %s format %s', db_name, backup_format)
 
-    cmd = ['pg_dump', '--no-owner']
-    cmd.append(db_name)
+    cmd = [find_pg_tool('pg_dump'), '--no-owner', db_name]
+    env = exec_pg_environ()
 
     if backup_format == 'zip':
         with tempfile.TemporaryDirectory() as dump_dir:
@@ -242,7 +298,7 @@ def dump_db(db_name, stream, backup_format='zip'):
                 with db.cursor() as cr:
                     json.dump(dump_db_manifest(cr), fh, indent=4)
             cmd.insert(-1, '--file=' + os.path.join(dump_dir, 'dump.sql'))
-            odoo.tools.exec_pg_command(*cmd)
+            subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, check=True)
             if stream:
                 odoo.tools.osutil.zip_dir(dump_dir, stream, include_dir=False, fnct_sort=lambda file_name: file_name != 'dump.sql')
             else:
@@ -252,7 +308,7 @@ def dump_db(db_name, stream, backup_format='zip'):
                 return t
     else:
         cmd.insert(-1, '--format=c')
-        stdin, stdout = odoo.tools.exec_pg_command_pipe(*cmd)
+        stdout = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE).stdout
         if stream:
             shutil.copyfileobj(stdout, stream)
         else:
@@ -274,12 +330,13 @@ def exp_restore(db_name, data, copy=False):
     return True
 
 @check_db_management_enabled
-def restore_db(db, dump_file, copy=False):
+def restore_db(db, dump_file, copy=False, neutralize_database=False):
     assert isinstance(db, str)
     if exp_db_exist(db):
-        _logger.info('RESTORE DB: %s already exists', db)
+        _logger.warning('RESTORE DB: %s already exists', db)
         raise Exception("Database already exists")
 
+    _logger.info('RESTORING DB: %s', db)
     _create_empty_database(db)
 
     filestore_path = None
@@ -302,11 +359,13 @@ def restore_db(db, dump_file, copy=False):
             pg_cmd = 'pg_restore'
             pg_args = ['--no-owner', dump_file]
 
-        args = []
-        args.append('--dbname=' + db)
-        pg_args = args + pg_args
-
-        if odoo.tools.exec_pg_command(pg_cmd, *pg_args):
+        r = subprocess.run(
+            [find_pg_tool(pg_cmd), '--dbname=' + db, *pg_args],
+            env=exec_pg_environ(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+        )
+        if r.returncode != 0:
             raise Exception("Couldn't restore database")
 
         registry = odoo.modules.registry.Registry.new(db)
@@ -315,6 +374,9 @@ def restore_db(db, dump_file, copy=False):
             if copy:
                 # if it's a copy of a database, force generation of a new dbuuid
                 env['ir.config_parameter'].init(force=True)
+            if neutralize_database:
+                odoo.modules.neutralize.neutralize_database(cr)
+
             if filestore_path:
                 filestore_dest = env['ir.attachment']._filestore()
                 shutil.move(filestore_path, filestore_dest)
@@ -332,7 +394,7 @@ def exp_rename(old_name, new_name):
         cr._cnx.autocommit = True
         _drop_conn(cr, old_name)
         try:
-            cr.execute(sql.SQL('ALTER DATABASE {} RENAME TO {}').format(sql.Identifier(old_name), sql.Identifier(new_name)))
+            cr.execute(SQL('ALTER DATABASE %s RENAME TO %s', database_identifier(cr, old_name), database_identifier(cr, new_name)))
             _logger.info('RENAME DB: %s -> %s', old_name, new_name)
         except Exception as e:
             _logger.info('RENAME DB: %s -> %s failed:\n%s', old_name, new_name, e)
@@ -347,7 +409,7 @@ def exp_rename(old_name, new_name):
 @check_db_management_enabled
 def exp_change_admin_password(new_password):
     odoo.tools.config.set_admin_password(new_password)
-    odoo.tools.config.save()
+    odoo.tools.config.save(['admin_passwd'])
     return True
 
 @check_db_management_enabled
@@ -384,16 +446,15 @@ def list_dbs(force=False):
         return res
 
     chosen_template = odoo.tools.config['db_template']
-    templates_list = tuple(set(['postgres', chosen_template]))
+    templates_list = tuple({'postgres', chosen_template})
     db = odoo.sql_db.db_connect('postgres')
     with closing(db.cursor()) as cr:
         try:
             cr.execute("select datname from pg_database where datdba=(select usesysid from pg_user where usename=current_user) and not datistemplate and datallowconn and datname not in %s order by datname", (templates_list,))
-            res = [odoo.tools.ustr(name) for (name,) in cr.fetchall()]
+            return [name for (name,) in cr.fetchall()]
         except Exception:
             _logger.exception('Listing databases failed:')
-            res = []
-    return res
+            return []
 
 def list_db_incompatible(databases):
     """"Check a list of databases if they are compatible with this version of Odoo
@@ -405,7 +466,7 @@ def list_db_incompatible(databases):
     server_version = '.'.join(str(v) for v in version_info[:2])
     for database_name in databases:
         with closing(db_connect(database_name).cursor()) as cr:
-            if odoo.tools.table_exists(cr, 'ir_module_module'):
+            if odoo.tools.sql.table_exists(cr, 'ir_module_module'):
                 cr.execute("SELECT latest_version FROM ir_module_module WHERE name=%s", ('base',))
                 base_version = cr.fetchone()
                 if not base_version or not base_version[0]:
@@ -429,7 +490,7 @@ def exp_list(document=False):
     return list_dbs()
 
 def exp_list_lang():
-    return odoo.tools.scan_languages()
+    return odoo.tools.misc.scan_languages()
 
 def exp_list_countries():
     list_countries = []

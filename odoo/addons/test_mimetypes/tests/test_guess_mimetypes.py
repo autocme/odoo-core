@@ -2,10 +2,11 @@
 import os.path
 
 from odoo.tests.common import BaseCase
-from odoo.tools.mimetypes import guess_mimetype
+from odoo.tools.misc import file_open
+from odoo.tools.mimetypes import guess_mimetype, magic
 
 def contents(extension):
-    with open(os.path.join(
+    with file_open(os.path.join(
         os.path.dirname(__file__),
         'testfiles',
         'case.{}'.format(extension)
@@ -34,6 +35,7 @@ class TestMimeGuessing(BaseCase):
             guess_mimetype(contents('xlsx')),
             'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )
+
     def test_odt(self):
         self.assertEqual(
             guess_mimetype(contents('odt')),
@@ -63,7 +65,8 @@ class TestMimeGuessing(BaseCase):
         )
 
     def test_unknown(self):
+        expected_mimetype = 'text/plain' if magic is None else 'text/csv'
         self.assertEqual(
             guess_mimetype(contents('csv')),
-            'application/octet-stream'
+            expected_mimetype
         )

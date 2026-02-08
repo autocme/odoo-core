@@ -1,59 +1,62 @@
-# -*- coding: utf-8 -*-
 import collections
 import threading
+import typing
+from collections.abc import Iterable, Iterator, MutableMapping
 
-from .func import synchronized
+from .func import locked
 
 __all__ = ['LRU']
 
-class LRU(object):
+K = typing.TypeVar('K')
+V = typing.TypeVar('V')
+
+
+class LRU(MutableMapping[K, V], typing.Generic[K, V]):
     """
     Implementation of a length-limited O(1) LRU map.
 
-    Original Copyright 2003 Josiah Carlson, later rebuilt on OrderedDict.
+    Original Copyright 2003 Josiah Carlson, later rebuilt on OrderedDict and added typing.
     """
-    def __init__(self, count, pairs=()):
+    def __init__(self, count: int, pairs: Iterable[tuple[K, V]] = ()):
         self._lock = threading.RLock()
         self.count = max(count, 1)
-        self.d = collections.OrderedDict()
+        self.d: collections.OrderedDict[K, V] = collections.OrderedDict()
         for key, value in pairs:
             self[key] = value
 
-    @synchronized()
-    def __contains__(self, obj):
+    @locked
+    def __contains__(self, obj: K) -> bool:
         return obj in self.d
 
-    def get(self, obj, val=None):
-        try:
-            return self[obj]
-        except KeyError:
-            return val
-
-    @synchronized()
-    def __getitem__(self, obj):
+    @locked
+    def __getitem__(self, obj: K) -> V:
         a = self.d[obj]
         self.d.move_to_end(obj, last=False)
         return a
 
-    @synchronized()
-    def __setitem__(self, obj, val):
+    @locked
+    def __setitem__(self, obj: K, val: V):
         self.d[obj] = val
         self.d.move_to_end(obj, last=False)
         while len(self.d) > self.count:
             self.d.popitem(last=True)
 
-    @synchronized()
-    def __delitem__(self, obj):
+    @locked
+    def __delitem__(self, obj: K):
         del self.d[obj]
 
-    @synchronized()
-    def __len__(self):
+    @locked
+    def __len__(self) -> int:
         return len(self.d)
 
-    @synchronized()
-    def pop(self,key):
+    @locked
+    def __iter__(self) -> Iterator[K]:
+        return iter(self.d)
+
+    @locked
+    def pop(self, key: K) -> V:
         return self.d.pop(key)
 
-    @synchronized()
+    @locked
     def clear(self):
         self.d.clear()

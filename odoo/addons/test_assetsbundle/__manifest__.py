@@ -4,16 +4,17 @@
     'version': '0.1',
     'category': 'Hidden/Tests',
     'description': """A module to verify the Assets Bundle mechanism.""",
-    'maintainer': 'Odoo SA',
     'depends': ['base'],
     'installable': True,
     'data': [
         "data/ir_asset.xml",
         "views/views.xml",
     ],
-    'auto_install': False,
 
     'assets': {
+        'web.assets_tests': [
+            'test_assetsbundle/static/tests/test_css_error.js',
+        ],
         'test_assetsbundle.bundle2': [
             'test_assetsbundle/static/src/css/test_cssfile1.css',
         ],
@@ -60,6 +61,25 @@
         'test_assetsbundle.manifest_multi_module1': [],
         'test_assetsbundle.broken_css': [
             'test_assetsbundle/static/invalid_src/css/invalid_css.css',
+        ],
+        'test_assetsbundle.lazy_test_component': [
+            'test_assetsbundle/static/tests/lazy_test_component/**/*',
+        ],
+        'test_assetsbundle.broken_xml': [
+            'test_assetsbundle/static/invalid_src/xml/invalid_xml.xml',
+        ],
+        'test_assetsbundle.multiple_broken_xml': [
+            'test_assetsbundle/static/invalid_src/xml/invalid_xml.xml',
+            'test_assetsbundle/static/invalid_src/xml/second_invalid_xml.xml',
+        ],
+        'test_assetsbundle.multiple_same_name':[
+          'test_assetsbundle/static/invalid_src/xml/multiple_same_name.xml',
+        ],
+        'test_assetsbundle.wo_name':[
+          'test_assetsbundle/static/invalid_src/xml/template_wo_name.xml',
+        ],
+        'test_assetsbundle.file_not_found':[
+          'test_assetsbundle/static/invalid_src/xml/file_not_found.xml',
         ],
     },
     'license': 'LGPL-3',

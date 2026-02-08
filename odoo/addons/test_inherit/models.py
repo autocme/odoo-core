@@ -49,7 +49,7 @@ class mother2(models.Model):
             if rec.field_in_mother:
                 rec.surname = rec.field_in_mother
             else:
-                super(mother, rec)._compute_surname()
+                super(mother2, rec)._compute_surname()
 
 
 class mother3(models.Model):
@@ -159,3 +159,9 @@ class IsPublishedMixin(models.AbstractModel):
     _description = "Test Inherit Mixin"
 
     published = fields.Boolean()
+
+
+class Message(models.Model):
+    _inherit = 'test_new_api.message'
+
+    body = fields.Text(translate=True)  # Test conversion of char (with trigram indexed) to jsonb postgreSQL type

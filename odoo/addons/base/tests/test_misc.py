@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 
+import base64
 import datetime
 from dateutil.relativedelta import relativedelta
 import os.path
@@ -14,40 +15,9 @@ from odoo.tools import (
     merge_sequences,
     misc,
     remove_accents,
-    validate_url,
 )
+from odoo.tools.mail import validate_url
 from odoo.tests.common import TransactionCase, BaseCase
-
-
-class TestCountingStream(BaseCase):
-    def test_empty_stream(self):
-        s = misc.CountingStream(iter([]))
-        self.assertEqual(s.index, -1)
-        self.assertIsNone(next(s, None))
-        self.assertEqual(s.index, 0)
-
-    def test_single(self):
-        s = misc.CountingStream(range(1))
-        self.assertEqual(s.index, -1)
-        self.assertEqual(next(s, None), 0)
-        self.assertIsNone(next(s, None))
-        self.assertEqual(s.index, 1)
-
-    def test_full(self):
-        s = misc.CountingStream(range(42))
-        for _ in s:
-            pass
-        self.assertEqual(s.index, 42)
-
-    def test_repeated(self):
-        """ Once the CountingStream has stopped iterating, the index should not
-        increase anymore (the internal state should not be allowed to change)
-        """
-        s = misc.CountingStream(iter([]))
-        self.assertIsNone(next(s, None))
-        self.assertEqual(s.index, 0)
-        self.assertIsNone(next(s, None))
-        self.assertEqual(s.index, 0)
 
 
 class TestMergeSequences(BaseCase):
@@ -105,6 +75,29 @@ class TestDateRangeFunction(BaseCase):
         dates = [date for date in date_utils.date_range(start, end)]
 
         self.assertEqual(dates, expected)
+
+    def test_date_range_with_date(self):
+        """ Check date_range with naive datetimes. """
+        start = datetime.date(1985, 1, 1)
+        end = datetime.date(1986, 1, 1)
+
+        expected = [
+            datetime.date(1985, 1, 1),
+            datetime.date(1985, 2, 1),
+            datetime.date(1985, 3, 1),
+            datetime.date(1985, 4, 1),
+            datetime.date(1985, 5, 1),
+            datetime.date(1985, 6, 1),
+            datetime.date(1985, 7, 1),
+            datetime.date(1985, 8, 1),
+            datetime.date(1985, 9, 1),
+            datetime.date(1985, 10, 1),
+            datetime.date(1985, 11, 1),
+            datetime.date(1985, 12, 1),
+            datetime.date(1986, 1, 1),
+        ]
+
+        self.assertEqual(list(date_utils.date_range(start, end)), expected)
 
     def test_date_range_with_timezone_aware_datetimes_other_than_utc(self):
         """ Check date_range with timezone-aware datetimes other than UTC."""
@@ -206,6 +199,8 @@ class TestFormatLangDate(TransactionCase):
         date_date = date_datetime.date()
         date_str = '2017-01-31'
         time_part = datetime.time(16, 30, 22)
+        t_medium = 'h:mm:ss a'
+        medium = f'MMM d, YYYY, {t_medium}'
 
         self.assertEqual(misc.format_date(self.env, date_datetime), '01/31/2017')
         self.assertEqual(misc.format_date(self.env, date_date), '01/31/2017')
@@ -214,16 +209,16 @@ class TestFormatLangDate(TransactionCase):
         self.assertEqual(misc.format_date(self.env, False), '')
         self.assertEqual(misc.format_date(self.env, None), '')
 
-        self.assertEqual(misc.format_datetime(self.env, date_datetime), 'Jan 31, 2017, 1:00:00 PM')
-        self.assertEqual(misc.format_datetime(self.env, datetime_str), 'Jan 31, 2017, 1:00:00 PM')
-        self.assertEqual(misc.format_datetime(self.env, ''), '')
-        self.assertEqual(misc.format_datetime(self.env, False), '')
-        self.assertEqual(misc.format_datetime(self.env, None), '')
+        self.assertEqual(misc.format_datetime(self.env, date_datetime, dt_format=medium), 'Jan 31, 2017, 1:00:00 PM')
+        self.assertEqual(misc.format_datetime(self.env, datetime_str, dt_format=medium), 'Jan 31, 2017, 1:00:00 PM')
+        self.assertEqual(misc.format_datetime(self.env, '', dt_format=medium), '')
+        self.assertEqual(misc.format_datetime(self.env, False, dt_format=medium), '')
+        self.assertEqual(misc.format_datetime(self.env, None, dt_format=medium), '')
 
-        self.assertEqual(misc.format_time(self.env, time_part), '4:30:22 PM')
-        self.assertEqual(misc.format_time(self.env, ''), '')
-        self.assertEqual(misc.format_time(self.env, False), '')
-        self.assertEqual(misc.format_time(self.env, None), '')
+        self.assertEqual(misc.format_time(self.env, time_part, time_format=t_medium), '4:30:22 PM')
+        self.assertEqual(misc.format_time(self.env, '', time_format=t_medium), '')
+        self.assertEqual(misc.format_time(self.env, False, time_format=t_medium), '')
+        self.assertEqual(misc.format_time(self.env, None, time_format=t_medium), '')
 
     def test_01_code_and_format(self):
         date_str = '2017-01-31'
@@ -255,35 +250,49 @@ class TestFormatLangDate(TransactionCase):
         self.assertNotEqual(misc.format_datetime(lang.with_context(lang='zh_CN').env, datetime_str, tz='America/New_York'), datetime_us_str)
 
         # Change language, timezone and format
-        self.assertEqual(misc.format_datetime(lang.with_context(lang='fr_FR').env, datetime_str, tz='America/New_York', dt_format='short'), '31/01/2017 05:33')
+        self.assertEqual(misc.format_datetime(lang.with_context(lang='fr_FR').env, datetime_str, tz='America/New_York', dt_format='dd/MM/YYYY HH:mm'), '31/01/2017 05:33')
         self.assertEqual(misc.format_datetime(lang.with_context(lang='en_US').env, datetime_str, tz='Europe/Brussels', dt_format='MMM d, y'), 'Jan 31, 2017')
 
         # Check given `lang_code` overwites context lang
-        self.assertEqual(misc.format_datetime(lang.env, datetime_str, tz='Europe/Brussels', dt_format='long', lang_code='fr_FR'), '31 janvier 2017 à 11:33:00 +0100')
-        self.assertEqual(misc.format_datetime(lang.with_context(lang='zh_CN').env, datetime_str, tz='Europe/Brussels', dt_format='long', lang_code='en_US'), 'January 31, 2017 at 11:33:00 AM +0100')
+        fmt_fr = 'dd MMMM YYYY à HH:mm:ss Z'
+        fmt_us = "MMMM dd, YYYY 'at' hh:mm:ss a Z"
+        self.assertEqual(misc.format_datetime(lang.env, datetime_str, tz='Europe/Brussels', dt_format=fmt_fr, lang_code='fr_FR'), '31 janvier 2017 à 11:33:00 +0100')
+        self.assertEqual(misc.format_datetime(lang.with_context(lang='zh_CN').env, datetime_str, tz='Europe/Brussels', dt_format=fmt_us, lang_code='en_US'), 'January 31, 2017 at 11:33:00 AM +0100')
 
         # -- test `time`
         time_part = datetime.time(16, 30, 22)
         time_part_tz = datetime.time(16, 30, 22, tzinfo=pytz.timezone('America/New_York'))  # 4:30 PM timezoned
 
-        self.assertEqual(misc.format_time(lang.with_context(lang='fr_FR').env, time_part), '16:30:22')
+        self.assertEqual(misc.format_time(lang.with_context(lang='fr_FR').env, time_part, time_format='HH:mm:ss'), '16:30:22')
         self.assertEqual(misc.format_time(lang.with_context(lang='zh_CN').env, time_part, time_format="ah:m:ss"), '\u4e0b\u53484:30:22')
 
         # Check format in different languages
-        self.assertEqual(misc.format_time(lang.with_context(lang='fr_FR').env, time_part, time_format='short'), '16:30')
+        self.assertEqual(misc.format_time(lang.with_context(lang='fr_FR').env, time_part, time_format='HH:mm'), '16:30')
         self.assertEqual(misc.format_time(lang.with_context(lang='zh_CN').env, time_part, time_format='ah:mm'), '\u4e0b\u53484:30')
 
         # Check timezoned time part
-        self.assertIn(misc.format_time(lang.with_context(lang='fr_FR').env, time_part_tz, time_format='long'), ['16:30:22 -0504', '16:30:22 HNE'])
+        self.assertEqual(misc.format_time(lang.with_context(lang='fr_FR').env, time_part_tz, time_format='HH:mm:ss Z'), '16:30:22 -0504')
         self.assertEqual(misc.format_time(lang.with_context(lang='zh_CN').env, time_part_tz, time_format='zzzz ah:mm:ss'), '\u5317\u7f8e\u4e1c\u90e8\u6807\u51c6\u65f6\u95f4\u0020\u4e0b\u53484:30:22')
 
         #Check timezone conversion in format_time
-        self.assertEqual(misc.format_time(lang.with_context(lang='fr_FR').env, datetime_str, 'Europe/Brussels', time_format='long'), '11:33:00 +0100')
-        self.assertEqual(misc.format_time(lang.with_context(lang='fr_FR').env, datetime_str, 'America/New_York', time_format='long'), '05:33:00 HNE')
+        self.assertEqual(misc.format_time(lang.with_context(lang='fr_FR').env, datetime_str, 'Europe/Brussels', time_format='HH:mm:ss Z'), '11:33:00 +0100')
+        self.assertEqual(misc.format_time(lang.with_context(lang='fr_FR').env, datetime_str, 'America/New_York', time_format='HH:mm:ss Z'), '05:33:00 -0500')
 
         # Check given `lang_code` overwites context lang
         self.assertEqual(misc.format_time(lang.with_context(lang='fr_FR').env, time_part, time_format='ah:mm', lang_code='zh_CN'), '\u4e0b\u53484:30')
-        self.assertEqual(misc.format_time(lang.with_context(lang='zh_CN').env, time_part, time_format='medium', lang_code='fr_FR'), '16:30:22')
+        self.assertEqual(misc.format_time(lang.with_context(lang='zh_CN').env, time_part, time_format='ah:mm', lang_code='fr_FR'), 'PM4:30')
+
+    def test_02_tz(self):
+        self.env.user.tz = 'Europe/Brussels'
+        datetime_str = '2016-12-31 23:55:00'
+        date_datetime = datetime.datetime.strptime(datetime_str, "%Y-%m-%d %H:%M:%S")
+
+        # While London is still in 2016, Brussels is already in 2017
+        self.assertEqual(misc.format_date(self.env, date_datetime), '01/01/2017')
+
+        # Force London timezone
+        date_datetime = date_datetime.replace(tzinfo=pytz.UTC)
+        self.assertEqual(misc.format_date(self.env, date_datetime), '12/31/2016', "User's tz must be ignored when tz is specifed in datetime object")
 
 
 class TestCallbacks(BaseCase):
@@ -479,6 +488,94 @@ class TestDictTools(BaseCase):
             dict.update(d, {'baz': 'xyz'})
 
 
+class TestFormatLang(TransactionCase):
+    def test_value_and_digits(self):
+        self.assertEqual(misc.formatLang(self.env, 100.23, digits=1), '100.2')
+        self.assertEqual(misc.formatLang(self.env, 100.23, digits=3), '100.230')
+
+        self.assertEqual(misc.formatLang(self.env, ''), '', 'If value is an empty string, it should return an empty string (not 0)')
+
+        self.assertEqual(misc.formatLang(self.env, 100), '100.00', 'If digits is None (default value), it should default to 2')
+
+        # Default rounding is 'HALF_EVEN'
+        self.assertEqual(misc.formatLang(self.env, 100.205), '100.20')
+        self.assertEqual(misc.formatLang(self.env, 100.215), '100.22')
+
+    def test_grouping(self):
+        self.env["res.lang"].create({
+            "name": "formatLang Lang",
+            "code": "fLT",
+            "grouping": "[3,2,-1]",
+            "decimal_point": "!",
+            "thousands_sep": "?",
+        })
+
+        self.env['res.lang']._activate_lang('fLT')
+
+        self.assertEqual(misc.formatLang(self.env['res.lang'].with_context(lang='fLT').env, 1000000000, grouping=True), '10000?00?000!00')
+        self.assertEqual(misc.formatLang(self.env['res.lang'].with_context(lang='fLT').env, 1000000000, grouping=False), '1000000000.00')
+
+    def test_decimal_precision(self):
+        decimal_precision = self.env['decimal.precision'].create({
+            'name': 'formatLang Decimal Precision',
+            'digits': 3,  # We want .001 decimals to make sure the decimal precision parameter 'dp' is chosen.
+        })
+
+        self.assertEqual(misc.formatLang(self.env, 100, dp=decimal_precision.name), '100.000')
+
+    def test_currency_object(self):
+        currency_object = self.env['res.currency'].create({
+            'name': 'formatLang Currency',
+            'symbol': 'fL',
+            'rounding': 0.1,  # We want .1 decimals to make sure 'currency_obj' is chosen.
+            'position': 'after',
+        })
+
+        self.assertEqual(misc.formatLang(self.env, 100, currency_obj=currency_object), '100.0%sfL' % u'\N{NO-BREAK SPACE}')
+
+        currency_object.write({'position': 'before'})
+
+        self.assertEqual(misc.formatLang(self.env, 100, currency_obj=currency_object), 'fL%s100.0' % u'\N{NO-BREAK SPACE}')
+
+    def test_decimal_precision_and_currency_object(self):
+        decimal_precision = self.env['decimal.precision'].create({
+            'name': 'formatLang Decimal Precision',
+            'digits': 3,
+        })
+
+        currency_object = self.env['res.currency'].create({
+            'name': 'formatLang Currency',
+            'symbol': 'fL',
+            'rounding': 0.1,
+            'position': 'after',
+        })
+
+        # If we have a 'dp' and 'currency_obj', we use the decimal precision of 'dp' and the format of 'currency_obj'.
+        self.assertEqual(misc.formatLang(self.env, 100, dp=decimal_precision.name, currency_obj=currency_object), '100.000%sfL' % u'\N{NO-BREAK SPACE}')
+
+    def test_rounding_method(self):
+        self.assertEqual(misc.formatLang(self.env, 100.205), '100.20')  # Default is 'HALF-EVEN'
+        self.assertEqual(misc.formatLang(self.env, 100.215), '100.22')  # Default is 'HALF-EVEN'
+
+        self.assertEqual(misc.formatLang(self.env, 100.205, rounding_method='HALF-UP'), '100.21')
+        self.assertEqual(misc.formatLang(self.env, 100.215, rounding_method='HALF-UP'), '100.22')
+
+        self.assertEqual(misc.formatLang(self.env, 100.205, rounding_method='HALF-DOWN'), '100.20')
+        self.assertEqual(misc.formatLang(self.env, 100.215, rounding_method='HALF-DOWN'), '100.21')
+
+    def test_rounding_unit(self):
+        self.assertEqual(misc.formatLang(self.env, 1000000.00), '1,000,000.00')
+        self.assertEqual(misc.formatLang(self.env, 1000000.00, rounding_unit='units'), '1,000,000')
+        self.assertEqual(misc.formatLang(self.env, 1000000.00, rounding_unit='thousands'), '1,000')
+        self.assertEqual(misc.formatLang(self.env, 1000000.00, rounding_unit='lakhs'), '10')
+        self.assertEqual(misc.formatLang(self.env, 1000000.00, rounding_unit="millions"), '1')
+
+    def test_rounding_method_and_rounding_unit(self):
+        self.assertEqual(misc.formatLang(self.env, 1822060000, rounding_method='HALF-UP', rounding_unit='lakhs'), '18,221')
+        self.assertEqual(misc.formatLang(self.env, 1822050000, rounding_method='HALF-UP', rounding_unit='lakhs'), '18,221')
+        self.assertEqual(misc.formatLang(self.env, 1822049900, rounding_method='HALF-UP', rounding_unit='lakhs'), '18,220')
+
+
 class TestUrlValidate(BaseCase):
     def test_url_validate(self):
         for case, truth in [
@@ -501,3 +598,35 @@ class TestUrlValidate(BaseCase):
         self.assertEqual(validate_url('/index.html'), 'http:///index.html')
         self.assertEqual(validate_url('?debug=1'), 'http://?debug=1')
         self.assertEqual(validate_url('#model=project.task&id=3603607'), 'http://#model=project.task&id=3603607')
+
+
+class TestMiscToken(TransactionCase):
+
+    def test_expired_token(self):
+        payload = {'test': True, 'value': 123456, 'some_string': 'hello', 'some_dict': {'name': 'New Dict'}}
+        expiration = datetime.datetime.now() - datetime.timedelta(days=1)
+        token = misc.hash_sign(self.env, 'test', payload, expiration=expiration)
+        self.assertIsNone(misc.verify_hash_signed(self.env, 'test', token))
+
+    def test_long_payload(self):
+        payload = {'test': True, 'value':123456, 'some_string': 'hello', 'some_dict': {'name': 'New Dict'}}
+        token = misc.hash_sign(self.env, 'test', payload, expiration_hours=24)
+        self.assertEqual(misc.verify_hash_signed(self.env, 'test', token), payload)
+
+    def test_None_payload(self):
+        with self.assertRaises(Exception):
+            misc.hash_sign(self.env, 'test', None, expiration_hours=24)
+
+    def test_list_payload(self):
+        payload = ["str1", "str2", "str3", 4, 5]
+        token = misc.hash_sign(self.env, 'test', payload, expiration_hours=24)
+        self.assertEqual(misc.verify_hash_signed(self.env, 'test', token), payload)
+
+    def test_modified_payload(self):
+        payload = ["str1", "str2", "str3", 4, 5]
+        token = base64.urlsafe_b64decode(misc.hash_sign(self.env, 'test', payload, expiration_hours=24) + '===')
+        new_timestamp = datetime.datetime.now() + datetime.timedelta(days=7)
+        new_timestamp = int(new_timestamp.timestamp())
+        new_timestamp = new_timestamp.to_bytes(8, byteorder='little')
+        token = base64.urlsafe_b64encode(token[:1] + new_timestamp + token[9:]).decode()
+        self.assertIsNone(misc.verify_hash_signed(self.env, 'test', token))

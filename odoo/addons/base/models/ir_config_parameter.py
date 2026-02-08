@@ -34,7 +34,7 @@ class IrConfigParameter(models.Model):
     _order = 'key'
     _allow_sudo_commands = False
 
-    key = fields.Char(required=True, index=True)
+    key = fields.Char(required=True)
     value = fields.Text(required=True)
 
     _sql_constraints = [
@@ -65,7 +65,7 @@ class IrConfigParameter(models.Model):
         :return: The value of the parameter, or ``default`` if it does not exist.
         :rtype: string
         """
-        self.check_access_rights('read')
+        self.browse().check_access('read')
         return self._get_param(key) or default
 
     @api.model
@@ -73,7 +73,7 @@ class IrConfigParameter(models.Model):
     def _get_param(self, key):
         # we bypass the ORM because get_param() is used in some field's depends,
         # and must therefore work even when the ORM is not ready to work
-        self.flush(['key', 'value'])
+        self.flush_model(['key', 'value'])
         self.env.cr.execute("SELECT value FROM ir_config_parameter WHERE key = %s", [key])
         result = self.env.cr.fetchone()
         return result and result[0]
@@ -104,7 +104,7 @@ class IrConfigParameter(models.Model):
 
     @api.model_create_multi
     def create(self, vals_list):
-        self.clear_caches()
+        self.env.registry.clear_cache()
         return super(IrConfigParameter, self).create(vals_list)
 
     def write(self, vals):
@@ -112,11 +112,11 @@ class IrConfigParameter(models.Model):
             illegal = _default_parameters.keys() & self.mapped('key')
             if illegal:
                 raise ValidationError(_("You cannot rename config parameters with keys %s", ', '.join(illegal)))
-        self.clear_caches()
+        self.env.registry.clear_cache()
         return super(IrConfigParameter, self).write(vals)
 
     def unlink(self):
-        self.clear_caches()
+        self.env.registry.clear_cache()
         return super(IrConfigParameter, self).unlink()
 
     @api.ondelete(at_uninstall=False)

@@ -8,12 +8,15 @@ import collections
 import functools
 import io
 import logging
+import mimetypes
 import re
 import zipfile
 
 __all__ = ['guess_mimetype']
 
 _logger = logging.getLogger(__name__)
+_logger_guess_mimetype = _logger.getChild('guess_mimetype')
+MIMETYPE_HEAD_SIZE = 2048
 
 # We define our own guess_mimetype implementation and if magic is available we
 # use it instead.
@@ -73,6 +76,13 @@ def _check_open_container_format(data):
 
         return False
 
+
+_old_ms_office_mimetypes = {
+    '.doc': 'application/msword',
+    '.xls': 'application/vnd.ms-excel',
+    '.ppt': 'application/vnd.ms-powerpoint',
+}
+_olecf_mimetypes = ('application/x-ole-storage', 'application/CDFV2')
 _xls_pattern = re.compile(b"""
     \x09\x08\x10\x00\x00\x06\x05\x00
   | \xFD\xFF\xFF\xFF(\x10|\x1F|\x20|"|\\#|\\(|\\))
@@ -109,6 +119,10 @@ def _check_svg(data):
     if b'<svg' in data and b'/svg' in data:
         return 'image/svg+xml'
 
+def _check_webp(data):
+    """This checks the presence of the WEBP and VP8 in the RIFF"""
+    if data[8:15] == b'WEBPVP8':
+        return 'image/webp'
 
 # for "master" formats with many subformats, discriminants is a list of
 # functions, tried in order and the first non-falsy value returned is the
@@ -127,6 +141,9 @@ _mime_mappings = (
         _check_svg,
     ]),
     _Entry('image/x-icon', [b'\x00\x00\x01\x00'], []),
+    _Entry('image/webp', [b'RIFF'], [
+        _check_webp,
+    ]),
     # OLECF files in general (Word, Excel, PPT, default to word because why not?)
     _Entry('application/msword', [b'\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1', b'\x0D\x44\x4F\x43'], [
         _check_olecf
@@ -152,7 +169,7 @@ def _odoo_guess_mimetype(bin_data, default='application/octet-stream'):
                         if guess: return guess
                     except Exception:
                         # log-and-next
-                        _logger.getChild('guess_mimetype').warn(
+                        _logger_guess_mimetype.warning(
                             "Sub-checker '%s' of type '%s' failed",
                             discriminant.__name__, entry.mimetype,
                             exc_info=True
@@ -160,6 +177,11 @@ def _odoo_guess_mimetype(bin_data, default='application/octet-stream'):
                 # if no discriminant or no discriminant matches, return
                 # primary mime type
                 return entry.mimetype
+    try:
+        if bin_data and all(c >= ' ' or c in '\t\n\r' for c in bin_data[:1024].decode()):
+            return 'text/plain'
+    except ValueError:
+        pass
     return default
 
 
@@ -180,15 +202,27 @@ if magic:
         _guesser = ms.buffer
 
     def guess_mimetype(bin_data, default=None):
-        mimetype = _guesser(bin_data[:1024])
+        mimetype = _guesser(bin_data[:MIMETYPE_HEAD_SIZE])
         # upgrade incorrect mimetype to official one, fixed upstream
         # https://github.com/file/file/commit/1a08bb5c235700ba623ffa6f3c95938fe295b262
         if mimetype == 'image/svg':
             return 'image/svg+xml'
+        # application/CDFV2 and application/x-ole-storage are two files
+        # formats that Microsoft Office was using before 2006. Use our
+        # own guesser to further discriminate the mimetype.
+        if mimetype in _olecf_mimetypes:
+            try:
+                if msoffice_mimetype := _check_olecf(bin_data):
+                    return msoffice_mimetype
+            except Exception:  # noqa: BLE001
+                _logger_guess_mimetype.warning(
+                    "Sub-checker '_check_olecf' of type '%s' failed",
+                    mimetype,
+                    exc_info=True,
+                )
         return mimetype
 else:
     guess_mimetype = _odoo_guess_mimetype
-
 
 
 def neuter_mimetype(mimetype, user):
@@ -198,12 +232,56 @@ def neuter_mimetype(mimetype, user):
     return mimetype
 
 
+_extension_pattern = re.compile(r'\w+')
 def get_extension(filename):
-    """ Return the extension the current filename based on the heuristic that
-    ext is less than or equal to 10 chars and is alphanumeric.
+    # A file has no extension if it has no dot (ignoring the leading one
+    # of hidden files) or that what follow the last dot is not a single
+    # word, e.g. "Mr. Doe"
+    _stem, dot, ext = filename.lstrip('.').rpartition('.')
+    if not dot or not _extension_pattern.fullmatch(ext):
+        return ''
 
-    :param str filename: filename to try and guess a extension for
-    :returns: detected extension or ``
+    # Assume all 4-chars extensions to be valid extensions even if it is
+    # not known from the mimetypes database. In /etc/mime.types, only 7%
+    # known extensions are longer.
+    if len(ext) <= 4:
+        return f'.{ext}'.lower()
+
+    # Use the mimetype database to determine the extension of the file.
+    guessed_mimetype, guessed_ext = mimetypes.guess_type(filename)
+    if guessed_ext:
+        return guessed_ext
+    if guessed_mimetype:
+        return f'.{ext}'.lower()
+
+    # Unknown extension.
+    return ''
+
+
+def fix_filename_extension(filename, mimetype):
     """
-    ext = '.' in filename and filename.split('.')[-1]
-    return ext and len(ext) <= 10 and ext.isalnum() and '.' + ext.lower() or ''
+    Make sure the filename ends with an extension of the mimetype.
+
+    :param str filename: the filename with an unsafe extension
+    :param str mimetype: the mimetype detected reading the file's content
+    :returns: the same filename if its extension matches the detected
+        mimetype, otherwise the same filename with the mimetype's
+        extension added at the end.
+    """
+    extension_mimetype = mimetypes.guess_type(filename)[0]
+    if extension_mimetype == mimetype:
+        return filename
+
+    extension = get_extension(filename)
+    if mimetype in _olecf_mimetypes and extension in _old_ms_office_mimetypes:
+        return filename
+
+    if mimetype == 'application/zip' and extension in {'.docx', '.xlsx', '.pptx'}:
+        return filename
+
+    if extension := mimetypes.guess_extension(mimetype):
+        _logger.warning("File %r has an invalid extension for mimetype %r, adding %r", filename, mimetype, extension)
+        return filename + extension
+
+    _logger.warning("File %r has an unknown extension for mimetype %r", filename, mimetype)
+    return filename

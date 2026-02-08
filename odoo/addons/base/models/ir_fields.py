@@ -1,20 +1,38 @@
 # -*- coding: utf-8 -*-
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 
+import json
 import functools
 import itertools
+from typing import NamedTuple
 
 import psycopg2
 import pytz
 
-from odoo import api, Command, fields, models, _
-from odoo.tools import ustr
+from odoo import api, Command, fields, models
+from odoo.tools import OrderedSet
+from odoo.tools.translate import _, code_translations, LazyTranslate
+
+_lt = LazyTranslate(__name__)
 
 REFERENCING_FIELDS = {None, 'id', '.id'}
 def only_ref_fields(record):
     return {k: v for k, v in record.items() if k in REFERENCING_FIELDS}
 def exclude_ref_fields(record):
     return {k: v for k, v in record.items() if k not in REFERENCING_FIELDS}
+
+# these lazy translations promise translations for ['yes', 'no', 'true', 'false']
+BOOLEAN_TRANSLATIONS = (
+    _lt('yes'),
+    _lt('no'),
+    _lt('true'),
+    _lt('false')
+)
+
+
+class FakeField(NamedTuple):
+    comodel_name: str
+    name: str
 
 
 class ImportWarning(Warning):
@@ -84,6 +102,7 @@ class IrFieldsConverter(models.AbstractModel):
         records matching what :meth:`odoo.osv.orm.Model.write` expects.
 
         :param model: :class:`odoo.osv.orm.Model` for the conversion base
+        :param fromtype:
         :returns: a converter callable
         :rtype: (record: dict, logger: (field, error) -> None) -> dict
         """
@@ -167,11 +186,11 @@ class IrFieldsConverter(models.AbstractModel):
         it returns. The handling of a warning at the upper levels is the same
         as ``ValueError`` above.
 
+        :param model:
         :param field: field object to generate a value for
         :type field: :class:`odoo.fields.Field`
         :param fromtype: type to convert to something fitting for ``field``
         :type fromtype: type | str
-        :param context: odoo request context
         :return: a function (fromtype -> field.write_type), if a converter is found
         :rtype: Callable | None
         """
@@ -183,14 +202,116 @@ class IrFieldsConverter(models.AbstractModel):
             return None
         return functools.partial(converter, model, field)
 
+    def _str_to_json(self, model, field, value):
+        try:
+            return json.loads(value), []
+        except ValueError:
+            msg = _("'%s' does not seem to be a valid JSON for field '%%(field)s'")
+            raise self._format_import_error(ValueError, msg, value)
+
+    def _str_to_properties(self, model, field, value):
+
+        # If we want to import the all properties at once (with the technical value)
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                msg = _("Unable to import'%%(field)s' Properties field as a whole, target individual property instead.")
+                raise self._format_import_error(ValueError, msg)
+
+        if not isinstance(value, list):
+            msg = _("Unable to import'%%(field)s' Properties field as a whole, target individual property instead.")
+            raise self._format_import_error(ValueError, msg, {'value': value})
+
+        warnings = []
+        for property_dict in value:
+            if not (property_dict.keys() >= {'name', 'type', 'string'}):
+                msg = _("'%(value)s' does not seem to be a valid Property value for field '%%(field)s'. Each property need at least 'name', 'type' and 'string' attribute.")
+                raise self._format_import_error(ValueError, msg, {'value': property_dict})
+
+            val = property_dict.get('value')
+            if not val:
+                property_dict.pop('value', None)
+                continue
+
+            property_type = property_dict['type']
+
+            if property_type == 'selection':
+                # either label or the technical value
+                new_val = next(iter(
+                    sel_val for sel_val, sel_label in property_dict['selection']
+                    if val in (sel_val, sel_label)
+                ), None)
+                if not new_val:
+                    msg = _("'%(value)s' does not seem to be a valid Selection value for '%(label_property)s' (subfield of '%%(field)s' field).")
+                    raise self._format_import_error(ValueError, msg, {'value': val, 'label_property': property_dict['string']})
+                property_dict['value'] = new_val
+
+            elif property_type == 'tags':
+                tags = val.split(',')
+                new_val = []
+                for tag in tags:
+                    val_tag = next(iter(
+                        tag_val for tag_val, tag_label, _color in property_dict['tags']
+                        if tag in (tag_val, tag_label)
+                    ), None)
+                    if not val_tag:
+                        msg = _("'%(value)s' does not seem to be a valid Tag value for '%(label_property)s' (subfield of '%%(field)s' field).")
+                        raise self._format_import_error(ValueError, msg, {'value': tag, 'label_property': property_dict['string']})
+                    new_val.append(val_tag)
+                property_dict['value'] = new_val
+
+            elif property_type == 'boolean':
+                new_val, warnings = self._str_to_boolean(model, field, val)
+                if not warnings:
+                    property_dict['value'] = new_val
+                else:
+                    msg = _("Unknown value '%(value)s' for boolean '%(label_property)s' property (subfield of '%%(field)s' field).")
+                    raise self._format_import_error(ValueError, msg, {'value': val, 'label_property': property_dict['string']})
+
+            elif property_type in ('many2one', 'many2many'):
+                [record] = property_dict['value']
+
+                subfield, w1 = self._referencing_subfield(record)
+                if w1:
+                    warnings.append(w1)
+
+                values = record[subfield]
+
+                references = values.split(',') if property_type == 'many2many' else [values]
+                ids = []
+                fake_field = FakeField(comodel_name=property_dict['comodel'], name=property_dict['string'])
+                for reference in references:
+                    id_, __, ws = self.db_id_for(model, fake_field, subfield, reference)
+                    ids.append(id_)
+                    warnings.extend(ws)
+
+                property_dict['value'] = ids if property_type == 'many2many' else ids[0]
+
+            elif property_type == 'integer':
+                try:
+                    property_dict['value'] = int(val)
+                except ValueError:
+                    msg = _("'%(value)s' does not seem to be an integer for field '%(label_property)s' property (subfield of '%%(field)s' field).")
+                    raise self._format_import_error(ValueError, msg, {'value': val, 'label_property': property_dict['string']})
+
+            elif property_type == 'float':
+                try:
+                    property_dict['value'] = float(val)
+                except ValueError:
+                    msg = _("'%(value)s' does not seem to be an float for field '%(label_property)s' property (subfield of '%%(field)s' field).")
+                    raise self._format_import_error(ValueError, msg, {'value': val, 'label_property': property_dict['string']})
+
+        return value, warnings
+
     @api.model
     def _str_to_boolean(self, model, field, value):
         # all translatables used for booleans
         # potentially broken casefolding? What about locales?
         trues = set(word.lower() for word in itertools.chain(
             [u'1', u"true", u"yes"], # don't use potentially translated values
-            self._get_translations(['code'], u"true"),
-            self._get_translations(['code'], u"yes"),
+            self._get_boolean_translations(u"true"),
+            self._get_boolean_translations(u"yes"),
         ))
         if value.lower() in trues:
             return True, []
@@ -198,8 +319,8 @@ class IrFieldsConverter(models.AbstractModel):
         # potentially broken casefolding? What about locales?
         falses = set(word.lower() for word in itertools.chain(
             [u'', u"0", u"false", u"no"],
-            self._get_translations(['code'], u"false"),
-            self._get_translations(['code'], u"no"),
+            self._get_boolean_translations(u"false"),
+            self._get_boolean_translations(u"no"),
         ))
         if value.lower() in falses:
             return False, []
@@ -295,17 +416,46 @@ class IrFieldsConverter(models.AbstractModel):
         return fields.Datetime.to_string(dt.astimezone(pytz.UTC)), []
 
     @api.model
-    def _get_translations(self, types, src):
-        types = tuple(types)
+    def _get_boolean_translations(self, src):
         # Cache translations so they don't have to be reloaded from scratch on
         # every row of the file
         tnx_cache = self._cr.cache.setdefault(self._name, {})
-        if tnx_cache.setdefault(types, {}) and src in tnx_cache[types]:
-            return tnx_cache[types][src]
+        if src in tnx_cache:
+            return tnx_cache[src]
 
-        Translations = self.env['ir.translation']
-        tnx = Translations.search([('type', 'in', types), ('src', '=', src)])
-        result = tnx_cache[types][src] = [t.value for t in tnx if t.value is not False]
+        values = OrderedSet()
+        for lang, __ in self.env['res.lang'].get_installed():
+            translations = code_translations.get_python_translations('base', lang)
+            if src in translations:
+                values.add(translations[src])
+
+        result = tnx_cache[src] = list(values)
+        return result
+
+    @api.model
+    def _get_selection_translations(self, field, src):
+        if not src:
+            return []
+        # Cache translations so they don't have to be reloaded from scratch on
+        # every row of the file
+        tnx_cache = self._cr.cache.setdefault(self._name, {})
+        if src in tnx_cache:
+            return tnx_cache[src]
+
+        values = OrderedSet()
+        self.env['ir.model.fields.selection'].flush_model()
+        query = """
+            SELECT s.name
+            FROM ir_model_fields_selection s
+            JOIN ir_model_fields f ON s.field_id = f.id
+            WHERE f.model = %s AND f.name = %s AND s.name->>'en_US' = %s
+        """
+        self.env.cr.execute(query, [field.model_name, field.name, src])
+        for (name,) in self.env.cr.fetchall():
+            name.pop('en_US')
+            values.update(name.values())
+
+        result = tnx_cache[src] = list(values)
         return result
 
     @api.model
@@ -315,8 +465,14 @@ class IrFieldsConverter(models.AbstractModel):
         selection = field.get_description(env)['selection']
 
         for item, label in selection:
-            label = ustr(label)
-            labels = [label] + self._get_translations(('selection', 'model', 'code'), label)
+            if callable(field.selection):
+                labels = [label]
+                for item2, label2 in field._description_selection(self.env):
+                    if item2 == item:
+                        labels.append(label2)
+                        break
+            else:
+                labels = [label] + self._get_selection_translations(field, label)
             # case insensitive comparaison of string to allow to set the value even if the given 'value' param is not
             # exactly (case sensitive) the same as one of the selection item.
             if value.lower() == str(item).lower() or any(value.lower() == label.lower() for label in labels):
@@ -341,11 +497,10 @@ class IrFieldsConverter(models.AbstractModel):
         :param model: model to which the field belongs
         :param field: relational field for which references are provided
         :param subfield: a relational subfield allowing building of refs to
-                         existing records: ``None`` for a name_get/name_search,
+                         existing records: ``None`` for a name_search,
                          ``id`` for an external id and ``.id`` for a database
                          id
         :param value: value of the reference to match to an actual record
-        :param context: OpenERP request context
         :return: a pair of the matched database identifier (if any), the
                  translated user-readable name for the field and the list of
                  warnings
@@ -361,7 +516,7 @@ class IrFieldsConverter(models.AbstractModel):
         action = {
             'name': 'Possible Values',
             'type': 'ir.actions.act_window', 'target': 'new',
-            'view_mode': 'tree,form',
+            'view_mode': 'list,form',
             'views': [(False, 'list'), (False, 'form')],
             'context': {'create': False},
             'help': _(u"See all possible values")}
@@ -376,18 +531,16 @@ class IrFieldsConverter(models.AbstractModel):
             field_type = _(u"database id")
             if isinstance(value, str) and not self._str_to_boolean(model, field, value)[0]:
                 return False, field_type, warnings
-            try: tentative_id = int(value)
-            except ValueError: tentative_id = value
             try:
-                if RelatedModel.search([('id', '=', tentative_id)]):
-                    id = tentative_id
-            except psycopg2.DataError:
-                # type error
+                tentative_id = int(value)
+            except ValueError:
                 raise self._format_import_error(
                     ValueError,
                     _(u"Invalid database id '%s' for the field '%%(field)s'"),
                     value,
                     {'moreinfo': action})
+            if RelatedModel.browse(tentative_id).exists():
+                id = tentative_id
         elif subfield == 'id':
             field_type = _(u"external id")
             if not self._str_to_boolean(model, field, value)[0]:
@@ -406,22 +559,24 @@ class IrFieldsConverter(models.AbstractModel):
             ids = RelatedModel.name_search(name=value, operator='=')
             if ids:
                 if len(ids) > 1:
-                    warnings.append(ImportWarning(
-                        _(u"Found multiple matches for value '%s' in field '%%(field)s' (%d matches)")
-                        %(str(value).replace('%', '%%'), len(ids))))
+                    warnings.append(ImportWarning(_(
+                        'Found multiple matches for value "%(value)s" in field "%%(field)s" (%(match_count)s matches)',
+                        value=str(value).replace('%', '%%'),
+                        match_count=len(ids),
+                    )))
                 id, _name = ids[0]
             else:
                 name_create_enabled_fields = self.env.context.get('name_create_enabled_fields') or {}
                 if name_create_enabled_fields.get(field.name):
                     try:
-                        id, _name = RelatedModel.name_create(name=value)
+                        with self.env.cr.savepoint():
+                            id, _name = RelatedModel.name_create(name=value)
                     except (Exception, psycopg2.IntegrityError):
-                        error_msg = _(u"Cannot create new '%s' records from their name alone. Please create those records manually and try importing again.", RelatedModel._description)
+                        error_msg = _("Cannot create new '%s' records from their name alone. Please create those records manually and try importing again.", RelatedModel._description)
         else:
             raise self._format_import_error(
                 Exception,
-                _(u"Unknown sub-field '%s'"),
-                subfield
+                _("Unknown sub-field “%s”", subfield),
             )
 
         set_empty = False
@@ -486,7 +641,7 @@ class IrFieldsConverter(models.AbstractModel):
         :return: the record subfield to use for referencing and a list of warnings
         :rtype: str, list
         """
-        # Can import by name_get, external id or database id
+        # Can import by display_name, external id or database id
         fieldset = set(record)
         if fieldset - REFERENCING_FIELDS:
             raise ValueError(
@@ -560,7 +715,7 @@ class IrFieldsConverter(models.AbstractModel):
         def log(f, exception):
             if not isinstance(exception, Warning):
                 current_field_name = self.env[field.comodel_name]._fields[f].string
-                arg0 = exception.args[0] % {'field': '%(field)s/' + current_field_name}
+                arg0 = exception.args[0].replace('%(field)s', '%(field)s/' + current_field_name)
                 exception.args = (arg0, *exception.args[1:])
                 raise exception
             warnings.append(exception)
@@ -596,37 +751,3 @@ class IrFieldsConverter(models.AbstractModel):
                 commands.append(Command.create(writable))
 
         return commands, warnings
-
-class O2MIdMapper(models.AbstractModel):
-    """
-    Updates the base class to support setting xids directly in create by
-    providing an "id" key (otherwise stripped by create) during an import
-    (which should strip 'id' from the input data anyway)
-    """
-    _inherit = 'base'
-
-    # sadly _load_records_create is only called for the toplevel record so we
-    # can't hook into that
-    @api.model_create_multi
-    @api.returns('self', lambda value: value.id)
-    def create(self, vals_list):
-        recs = super().create(vals_list)
-
-        import_module = self.env.context.get('_import_current_module')
-        if not import_module: # not an import -> bail
-            return recs
-        noupdate = self.env.context.get('noupdate', False)
-
-        xids = (v.get('id') for v in vals_list)
-        self.env['ir.model.data']._update_xmlids([
-            {
-                'xml_id': xid if '.' in xid else ('%s.%s' % (import_module, xid)),
-                'record': rec,
-                # note: this is not used when updating o2ms above...
-                'noupdate': noupdate,
-            }
-            for rec, xid in zip(recs, xids)
-            if xid and isinstance(xid, str)
-        ])
-
-        return recs
